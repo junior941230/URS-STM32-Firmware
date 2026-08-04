@@ -44,12 +44,27 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 
 # Add sources to executable
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
-    # Add user sources here
+    Core/Src/motor_can.c
+    Core/Src/usb_command.c
+    USB_DEVICE/App/usb_device.c
+    USB_DEVICE/App/usbd_desc.c
+    USB_DEVICE/App/usbd_cdc_if.c
+    USB_DEVICE/Target/usbd_conf.c
+    Middlewares/ST/STM32_USB_Device_Library/Core/Src/usbd_core.c
+    Middlewares/ST/STM32_USB_Device_Library/Core/Src/usbd_ctlreq.c
+    Middlewares/ST/STM32_USB_Device_Library/Core/Src/usbd_ioreq.c
+    Middlewares/ST/STM32_USB_Device_Library/Class/CDC/Src/usbd_cdc.c
+    Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_pcd.c
+    Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_pcd_ex.c
+    Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_ll_usb.c
 )
 
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
-    # Add user defined include paths
+    USB_DEVICE/App
+    USB_DEVICE/Target
+    Middlewares/ST/STM32_USB_Device_Library/Core/Inc
+    Middlewares/ST/STM32_USB_Device_Library/Class/CDC/Inc
 )
 
 # Add project symbols (macros)

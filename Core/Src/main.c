@@ -21,6 +21,9 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "motor_can.h"
+#include "usb_command.h"
+#include "usb_device.h"
 
 /* USER CODE END Includes */
 
@@ -105,6 +108,16 @@ int main(void)
   MX_I2C1_Init();
   /* USER CODE BEGIN 2 */
 
+  /* 邏輯 CAN1 對應 FDCAN3；邏輯 CAN2 對應 FDCAN2。 */
+  if (MotorCAN_Init(&hfdcan3, &hfdcan2) != MOTOR_CAN_STATUS_OK)
+  {
+    Error_Handler();
+  }
+
+  /* 先清空 command queue，再啟動 USB CDC，避免列舉期間收到舊資料。 */
+  USB_Command_Init();
+  MX_USB_Device_Init();
+
   /* USER CODE END 2 */
 
   /* Initialize led */
@@ -152,6 +165,8 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    MotorCAN_Process();
+    USB_Command_Process();
   }
   /* USER CODE END 3 */
 }

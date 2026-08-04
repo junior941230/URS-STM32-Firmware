@@ -58,6 +58,7 @@
 /* FDCAN handle 定義於 main.c，供 IRQ handler 呼叫 HAL 使用。 */
 extern FDCAN_HandleTypeDef hfdcan2;
 extern FDCAN_HandleTypeDef hfdcan3;
+extern PCD_HandleTypeDef hpcd_USB_FS;
 
 /* USER CODE BEGIN EV */
 
@@ -223,6 +224,14 @@ void FDCAN2_IT0_IRQHandler(void)
 void FDCAN3_IT0_IRQHandler(void)
 {
   HAL_FDCAN_IRQHandler(&hfdcan3);
+}
+
+/**
+  * @brief 處理 USB Full-Speed low-priority interrupt
+  */
+void USB_LP_IRQHandler(void)
+{
+  HAL_PCD_IRQHandler(&hpcd_USB_FS);
 }
 
 /**

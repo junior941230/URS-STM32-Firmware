@@ -1,0 +1,1 @@
+"C:\Users\junio\AppData\Local\stm32cube\bundles\programmer\2.23.0\bin\STM32_Programmer_CLI.exe" -c port=SWD -w ".\build\Debug\URS.elf" -v -rst
