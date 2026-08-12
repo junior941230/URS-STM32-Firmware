@@ -55,8 +55,13 @@ COM_InitTypeDef BspCOMInit;
 __IO uint32_t BspButtonState = BUTTON_RELEASED;
 
 /* USER CODE BEGIN PV */
-/* EMS 一旦觸發就保持為 1，避免接點恢復後自動重新啟動。 */
-static volatile uint8_t ems_stop_latched;
+/*
+ * EMS 狀態由 EXTI callback 更新，主迴圈與 USB callback 讀取，所以必須 volatile。
+ * HIGH 代表立即停止；HIGH->LOW 後仍保持 command block，直到主迴圈清除 MotorCAN
+ * state、CAN RX queue 與 USB RX parser，避免 EMS 期間殘留的命令在釋放後執行。
+ */
+static volatile uint8_t ems_stop_active;
+static volatile uint8_t ems_release_cleanup_pending;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -108,13 +113,18 @@ int main(void)
   MX_I2C1_Init();
   /* USER CODE BEGIN 2 */
 
-  /* 邏輯 CAN1 對應 FDCAN3；邏輯 CAN2 對應 FDCAN2。 */
+  /*
+   * 專案刻意用邏輯 bus 編號隔離 MCU peripheral 名稱：
+   *   bus 1 -> FDCAN3 -> PCB CAN1 接頭
+   *   bus 2 -> FDCAN2 -> PCB CAN2 接頭
+   * 後續 USB 命令只看到 bus 1/2，不需要知道 STM32 instance 編號。
+   */
   if (MotorCAN_Init(&hfdcan3, &hfdcan2) != MOTOR_CAN_STATUS_OK)
   {
     Error_Handler();
   }
 
-  /* 先清空 command queue，再啟動 USB CDC，避免列舉期間收到舊資料。 */
+  /* 先清空 command queue，再啟動 USB CDC，避免列舉 callback 讀到未初始化索引。 */
   USB_Command_Init();
   MX_USB_Device_Init();
 
@@ -165,6 +175,20 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    /*
+     * EMS 釋放採兩階段 handshake：ISR 只標記 cleanup pending；主迴圈才呼叫
+     * 可能操作 FDCAN 與 queue 的清理函式。兩邊都清完後才解除 command block。
+     */
+    if (EMS_IsReleaseCleanupPending())
+    {
+      MotorCAN_ClearPendingCommands();
+      USB_Command_ClearPendingCommands();
+      EMS_CompleteReleaseCleanup();
+    }
+    /*
+     * 先處理 CAN/EMS，再解析 USB。若本輪剛收到 EMS，MotorCAN 可優先停止動作；
+     * USB command 層則依 EMS_AreCommandsBlocked() 決定是否接受下一條命令。
+     */
     MotorCAN_Process();
     USB_Command_Process();
   }
@@ -334,7 +358,7 @@ static void MX_GPIO_Init(void)
 
   /* EMS_SW 由外部電路偏壓：常閉迴路正常時為 LOW，斷路或停止時為 HIGH。 */
   GPIO_InitStruct.Pin = EMS_SW_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING_FALLING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(EMS_SW_GPIO_Port, &GPIO_InitStruct);
 
@@ -343,27 +367,57 @@ static void MX_GPIO_Init(void)
   HAL_NVIC_EnableIRQ(EXTI2_IRQn);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
-  /* 若上電時 EMS 迴路已斷開，立即鎖存停止要求。 */
-  if (HAL_GPIO_ReadPin(EMS_SW_GPIO_Port, EMS_SW_Pin) == GPIO_PIN_SET)
-  {
-    ems_stop_latched = 1U;
-  }
+  /*
+   * 上電時直接採用 EMS 腳位現況。若當下為 HIGH，USB 仍可完成列舉與傳送
+   * 狀態，但 receive callback 會丟棄控制命令，直到 EMS 釋放並完成清理。
+   */
+  ems_stop_active =
+    (HAL_GPIO_ReadPin(EMS_SW_GPIO_Port, EMS_SW_Pin) == GPIO_PIN_SET) ? 1U : 0U;
+  ems_release_cleanup_pending = 0U;
   /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
 
 /**
-  * @brief 取得 EMS 停止要求的鎖存狀態
-  * @retval 1 表示已鎖存停止要求；0 表示尚未鎖存
+  * @brief 取得 EMS 目前是否處於停止狀態
+  * @retval 1 表示 EMS 仍為 HIGH；0 表示 EMS 已釋放
   */
-uint8_t EMS_IsStopLatched(void)
+uint8_t EMS_IsStopActive(void)
 {
-  return ems_stop_latched;
+  return ems_stop_active;
 }
 
 /**
-  * @brief GPIO EXTI callback；EMS 出現 HIGH 時鎖存停止要求
+  * @brief 判斷是否暫停接受新指令
+  * @retval 1 表示 EMS 啟動中或釋放清理尚未完成
+  */
+uint8_t EMS_AreCommandsBlocked(void)
+{
+  /* 釋放後的短暫 cleanup window 也必須阻擋命令，避免 ISR 與主迴圈競態。 */
+  return (ems_stop_active || ems_release_cleanup_pending) ? 1U : 0U;
+}
+
+/**
+  * @brief 判斷 EMS 釋放後是否尚未清除未完成指令
+  * @retval 1 表示主迴圈必須執行清理
+  */
+uint8_t EMS_IsReleaseCleanupPending(void)
+{
+  return ems_release_cleanup_pending;
+}
+
+/**
+  * @brief 通知 EMS 釋放清理已完成，可以接受新指令
+  * @retval 無
+  */
+void EMS_CompleteReleaseCleanup(void)
+{
+  ems_release_cleanup_pending = 0U;
+}
+
+/**
+  * @brief GPIO EXTI callback；同步 EMS 啟動與釋放狀態
   * @param GPIO_Pin 觸發中斷的 GPIO 腳位
   * @retval 無
   */
@@ -371,7 +425,20 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
   if (GPIO_Pin == EMS_SW_Pin)
   {
-    ems_stop_latched = 1U;
+    /*
+     * 使用同一個 rising/falling callback 重新讀取 pin，而不依賴 edge 類型：
+     * HIGH 立即封鎖控制；LOW 先要求主迴圈清理，清理完成後才恢復命令。
+     */
+    if (HAL_GPIO_ReadPin(EMS_SW_GPIO_Port, EMS_SW_Pin) == GPIO_PIN_SET)
+    {
+      ems_stop_active = 1U;
+      ems_release_cleanup_pending = 0U;
+    }
+    else
+    {
+      ems_stop_active = 0U;
+      ems_release_cleanup_pending = 1U;
+    }
   }
 }
 

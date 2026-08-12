@@ -62,6 +62,10 @@ void USBD_Clock_Config(void)
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_CRSInitTypeDef RCC_CRSInitStruct= {0};
 
+  /*
+   * USB Full-Speed 需要精準 48 MHz。先啟用獨立 HSI48，再以 USB SOF 的
+   * 1 kHz frame timing 驅動 CRS 自動校正，避免 RC oscillator 漂移造成斷線。
+   */
   /* Enable HSI48 */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI48;
   RCC_OscInitStruct.HSI48State = RCC_HSI48_ON;
@@ -111,6 +115,10 @@ void MX_USB_Device_Init(void)
    USBD_Clock_Config();
   /* USER CODE END USB_Device_Init_PreTreatment */
 
+  /*
+   * 初始化順序不可交換：core 需要 descriptor，接著註冊 CDC class 與專案
+   * callback table，最後 USBD_Start() 才讓 pull-up 生效並開始接受主機列舉。
+   */
   /* Init Device Library, add supported class and start the library. */
   if (USBD_Init(&hUsbDeviceFS, &CDC_Desc, DEVICE_FS) != USBD_OK) {
     Error_Handler();

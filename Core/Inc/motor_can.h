@@ -7,27 +7,41 @@ extern "C" {
 
 #include "stm32g4xx_hal.h"
 
-/* 對外操作一次只允許執行一項，避免改 ID 與轉動測試互相干擾。 */
+/**
+  * @brief Motor CAN 模組目前執行中的高階操作。
+  *
+  * 模組使用單一非同步 state machine，所以同一時間只允許一項操作。
+  * 呼叫任一 MotorCAN_Start*() 後，應持續在主迴圈呼叫
+  * MotorCAN_Process()，直到 MotorCAN_GetEvent() 取到完成或錯誤事件。
+  */
 typedef enum
 {
   MOTOR_CAN_OPERATION_NONE = 0,
   MOTOR_CAN_OPERATION_INFO,
   MOTOR_CAN_OPERATION_SET_ID,
   MOTOR_CAN_OPERATION_TEST,
+  MOTOR_CAN_OPERATION_HOME,
   MOTOR_CAN_OPERATION_PROVISION_1M
 } MotorCAN_Operation;
 
+/**
+  * @brief 啟動操作時立即回傳的狀態。
+  *
+  * 這些值只表示「是否成功接受要求」。真正的馬達執行結果會稍後透過
+  * MotorCAN_Event 回報。
+  */
 typedef enum
 {
   MOTOR_CAN_STATUS_OK = 0,
   MOTOR_CAN_STATUS_NOT_READY,
   MOTOR_CAN_STATUS_BUSY,
   MOTOR_CAN_STATUS_INVALID_ARGUMENT,
-  MOTOR_CAN_STATUS_EMS_LATCHED,
+  MOTOR_CAN_STATUS_EMS_ACTIVE,
   MOTOR_CAN_STATUS_TX_FAILED,
   MOTOR_CAN_STATUS_RECONFIG_FAILED
 } MotorCAN_Status;
 
+/** @brief 非同步操作完成後，由 event queue 回報給 USB command 層的事件。 */
 typedef enum
 {
   MOTOR_CAN_EVENT_NONE = 0,
@@ -36,9 +50,12 @@ typedef enum
   MOTOR_CAN_EVENT_MOTOR_RATE_1M,
   MOTOR_CAN_EVENT_TEST_FINISHED,
   MOTOR_CAN_EVENT_TEST_STOPPED_BY_EMS,
+  MOTOR_CAN_EVENT_HOME_FINISHED,
+  MOTOR_CAN_EVENT_HOME_STOPPED_BY_EMS,
   MOTOR_CAN_EVENT_ERROR
 } MotorCAN_EventType;
 
+/** @brief Motor CAN state machine 對外回報的失敗原因。 */
 typedef enum
 {
   MOTOR_CAN_ERROR_NONE = 0,
@@ -51,9 +68,16 @@ typedef enum
   MOTOR_CAN_ERROR_RX_OVERFLOW,
   MOTOR_CAN_ERROR_BUS,
   MOTOR_CAN_ERROR_TX,
-  MOTOR_CAN_ERROR_RECONFIG_FAILED
+  MOTOR_CAN_ERROR_RECONFIG_FAILED,
+  MOTOR_CAN_ERROR_HOME_TIMEOUT
 } MotorCAN_Error;
 
+/**
+  * @brief 一筆非同步 Motor CAN 結果。
+  *
+  * 不同事件只會使用其中一部分欄位。例如 INFO 會填入版本欄位，SET_ID
+  * 會填入 old_id/new_id，ERROR 會填入 error；未使用欄位維持 0。
+  */
 typedef struct
 {
   MotorCAN_EventType type;
@@ -78,6 +102,12 @@ MotorCAN_Status MotorCAN_Init(FDCAN_HandleTypeDef *can1_handle,
 /** @brief 在主迴圈處理 CAN 回覆、逾時與 EMS 停止要求。 */
 void MotorCAN_Process(void);
 
+/**
+  * @brief EMS 釋放時停止並清除所有尚未完成的馬達指令。
+  * @note 若正在 PROVISION_1M，會盡力把 STM32 CAN bus 恢復為 1 Mbit/s。
+  */
+void MotorCAN_ClearPendingCommands(void);
+
 /** @brief 讀取指定 MKS Servo42ES 的硬體與韌體版本。 */
 MotorCAN_Status MotorCAN_StartInfo(uint8_t bus, uint16_t id);
 
@@ -90,9 +120,25 @@ MotorCAN_Status MotorCAN_StartSetId(uint8_t bus, uint16_t old_id,
 
 /**
   * @brief 執行固定 30 RPM、500 ms 的低速短時間測試
-  * @note EMS 已鎖存時不會啟動；測試結束後會 Disable 馬達。
+  * @note EMS 啟動時不會執行；測試結束後會 Disable 馬達。
   */
 MotorCAN_Status MotorCAN_StartTest(uint8_t bus, uint16_t id);
+
+/**
+  * @brief 使用 Servo42ES 的 origin switch 執行 homing
+  * @param direction 0 代表正向，1 代表反向
+  * @param high_speed_rpm 尋找原點的高速段，範圍 1..3000 RPM
+  * @param low_speed_rpm 精確尋找原點的低速段，範圍 1..100 RPM
+  * @param origin_offset 找到開關後要移動到的有號位置偏移量
+  * @param timeout_ms 馬達內部 homing timeout，範圍 1000..120000 ms
+  * @note PCB1 的 RPI-352 經 2N7002 接到馬達 IN-，因此使用 active-low 原點開關設定。
+  */
+MotorCAN_Status MotorCAN_StartHome(uint8_t bus, uint16_t id,
+                                   uint8_t direction,
+                                   uint16_t high_speed_rpm,
+                                   uint16_t low_speed_rpm,
+                                   int32_t origin_offset,
+                                   uint32_t timeout_ms);
 
 /**
   * @brief 將指定 STM32 CAN bus 切換為 500 或 1000 kbit/s。
@@ -109,10 +155,13 @@ uint16_t MotorCAN_GetBusBitrate(uint8_t bus);
   */
 MotorCAN_Status MotorCAN_StartProvision1M(uint8_t bus, uint16_t id);
 
-/** @brief 取出一筆非同步操作結果。 */
+/**
+  * @brief 取出一筆非同步操作結果。
+  * @retval 1 已將事件寫入 event；0 表示 queue 為空或 event 是 NULL。
+  */
 uint8_t MotorCAN_GetEvent(MotorCAN_Event *event);
 
-/** @brief 取得目前執行中的操作。 */
+/** @brief 取得目前執行中的操作；閒置時回傳 MOTOR_CAN_OPERATION_NONE。 */
 MotorCAN_Operation MotorCAN_GetOperation(void);
 
 #ifdef __cplusplus

@@ -28,6 +28,13 @@
 
 /* USER CODE BEGIN Includes */
 
+/*
+ * 本檔是 ST USB Device middleware 與 STM32 HAL PCD 之間的低階 adapter。
+ * 上層 USBD_* request 會在這裡轉成 HAL_PCD_* endpoint 操作；反方向則由
+ * HAL_PCD_*Callback() 把 USB IRQ 事件送回 USBD_LL_*。應用程式命令 parser
+ * 不在此層執行，避免把 protocol 邏輯放進 USB interrupt path。
+ */
+
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -67,6 +74,16 @@ extern void SystemClock_Config(void);
 *******************************************************************************/
 /* MSP Init */
 
+/**
+ * @brief 初始化 USB FS peripheral 的板級資源。
+ *
+ * 只有當傳入 handle 指向本專案使用的 `USB` instance 時，才會開啟 USB
+ * peripheral clock、設定 `USB_LP_IRQn` 優先序並啟用 IRQ。函式名稱會依
+ * `USE_HAL_PCD_REGISTER_CALLBACKS` 切換成靜態 callback 或 HAL 預設 weak
+ * callback 的覆寫版本，但兩個條件分支共用同一份實作。
+ *
+ * @param pcdHandle HAL PCD handle；非 USB FS instance 時不執行任何動作。
+ */
 #if (USE_HAL_PCD_REGISTER_CALLBACKS == 1U)
 static void HAL_PCD_MspInit(PCD_HandleTypeDef* pcdHandle)
 #else
@@ -90,6 +107,15 @@ void HAL_PCD_MspInit(PCD_HandleTypeDef* pcdHandle)
   }
 }
 
+/**
+ * @brief 解除 USB FS peripheral 使用的板級資源。
+ *
+ * 只有 handle 指向 `USB` instance 時才會關閉 USB peripheral clock 並停用
+ * `USB_LP_IRQn`。GPIOA clock 刻意保留，因為同一個 GPIO port 還承載 SWD
+ * 與其他功能，若一併關閉會造成除錯介面或其他周邊失效。
+ *
+ * @param pcdHandle HAL PCD handle；非 USB FS instance 時不執行任何動作。
+ */
 #if (USE_HAL_PCD_REGISTER_CALLBACKS == 1U)
 static void HAL_PCD_MspDeInit(PCD_HandleTypeDef* pcdHandle)
 #else

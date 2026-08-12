@@ -56,7 +56,17 @@ extern "C" {
 void Error_Handler(void);
 
 /* USER CODE BEGIN EFP */
-uint8_t EMS_IsStopLatched(void);
+/** @brief 讀取 EMS 實體輸入目前是否為停止狀態。 */
+uint8_t EMS_IsStopActive(void);
+
+/** @brief EMS 啟動中或釋放清理尚未完成時，禁止接收新命令。 */
+uint8_t EMS_AreCommandsBlocked(void);
+
+/** @brief 主迴圈是否需要執行 EMS 釋放後的 queue/state 清理。 */
+uint8_t EMS_IsReleaseCleanupPending(void);
+
+/** @brief 主迴圈完成所有 EMS 釋放清理後，解除 command block。 */
+void EMS_CompleteReleaseCleanup(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/

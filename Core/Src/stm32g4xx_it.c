@@ -52,6 +52,12 @@
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
+/*
+ * IRQ handler 維持最薄的一層：只把事件交給 HAL/BSP。
+ * HAL callback 再將資料放入 queue 或更新旗標，複雜 state machine 留在主迴圈。
+ * EMS EXTI priority 0 高於 FDCAN priority 1 與 USB priority 6。
+ */
+
 /* USER CODE END 0 */
 
 /* External variables --------------------------------------------------------*/
@@ -207,6 +213,7 @@ void SysTick_Handler(void)
   */
 void EXTI2_IRQHandler(void)
 {
+  /* HAL 會清 EXTI pending bit，接著呼叫 main.c 的 HAL_GPIO_EXTI_Callback()。 */
   HAL_GPIO_EXTI_IRQHandler(EMS_SW_Pin);
 }
 
@@ -215,6 +222,7 @@ void EXTI2_IRQHandler(void)
   */
 void FDCAN2_IT0_IRQHandler(void)
 {
+  /* HAL 讀取 peripheral interrupt 狀態後，分派 RX/error callback。 */
   HAL_FDCAN_IRQHandler(&hfdcan2);
 }
 
@@ -231,6 +239,7 @@ void FDCAN3_IT0_IRQHandler(void)
   */
 void USB_LP_IRQHandler(void)
 {
+  /* PCD callback 會一路把 endpoint 事件交給 USB Device Core 與 CDC class。 */
   HAL_PCD_IRQHandler(&hpcd_USB_FS);
 }
 

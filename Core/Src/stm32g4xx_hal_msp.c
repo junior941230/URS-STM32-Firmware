@@ -55,6 +55,12 @@
 
 /* USER CODE BEGIN 0 */
 
+/*
+ * MSP 層只負責 MCU peripheral 的底層資源：clock、GPIO alternate function、NVIC。
+ * 協定與 Motor CAN state machine 不放在這裡。邏輯 CAN1 使用 FDCAN3，邏輯 CAN2
+ * 使用 FDCAN2；兩個 instance 共用 FDCAN kernel clock，因此以計數器管理生命週期。
+ */
+
 /* USER CODE END 0 */
 /**
   * Initializes the Global MSP.
@@ -102,6 +108,7 @@ void HAL_FDCAN_MspInit(FDCAN_HandleTypeDef* hfdcan)
       Error_Handler();
     }
 
+    /* 只在第一個 instance 初始化時開 clock，避免重複開關共用資源。 */
     HAL_RCC_FDCAN_CLK_ENABLED++;
     if (HAL_RCC_FDCAN_CLK_ENABLED == 1U)
     {
@@ -121,6 +128,7 @@ void HAL_FDCAN_MspInit(FDCAN_HandleTypeDef* hfdcan)
       GPIO_InitStruct.Alternate = GPIO_AF9_FDCAN2;
       HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
+      /* CAN IRQ priority 1，僅低於 priority 0 的 EMS EXTI。 */
       HAL_NVIC_SetPriority(FDCAN2_IT0_IRQn, 1, 0);
       HAL_NVIC_EnableIRQ(FDCAN2_IT0_IRQn);
     }
