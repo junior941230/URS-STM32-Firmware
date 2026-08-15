@@ -62,6 +62,8 @@ __IO uint32_t BspButtonState = BUTTON_RELEASED;
  */
 static volatile uint8_t ems_stop_active;
 static volatile uint8_t ems_release_cleanup_pending;
+/* 每次 EMS 釋放只清一次 USB RX，之後仍允許 PING/HELP/STATUS。 */
+static volatile uint8_t ems_usb_cleanup_pending;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -181,9 +183,15 @@ int main(void)
      */
     if (EMS_IsReleaseCleanupPending())
     {
-      MotorCAN_ClearPendingCommands();
-      USB_Command_ClearPendingCommands();
-      EMS_CompleteReleaseCleanup();
+      if (ems_usb_cleanup_pending)
+      {
+        USB_Command_ClearPendingCommands();
+        ems_usb_cleanup_pending = 0U;
+      }
+      if (MotorCAN_ClearPendingCommands())
+      {
+        EMS_CompleteReleaseCleanup();
+      }
     }
     /*
      * 先處理 CAN/EMS，再解析 USB。若本輪剛收到 EMS，MotorCAN 可優先停止動作；
@@ -369,11 +377,12 @@ static void MX_GPIO_Init(void)
   /* USER CODE BEGIN MX_GPIO_Init_2 */
   /*
    * 上電時直接採用 EMS 腳位現況。若當下為 HIGH，USB 仍可完成列舉與傳送
-   * 狀態，但 receive callback 會丟棄控制命令，直到 EMS 釋放並完成清理。
+   * PING/HELP/STATUS；其餘命令由 parser 回覆 EMS_ACTIVE。
    */
   ems_stop_active =
     (HAL_GPIO_ReadPin(EMS_SW_GPIO_Port, EMS_SW_Pin) == GPIO_PIN_SET) ? 1U : 0U;
   ems_release_cleanup_pending = 0U;
+  ems_usb_cleanup_pending = 0U;
   /* USER CODE END MX_GPIO_Init_2 */
 }
 
@@ -414,6 +423,7 @@ uint8_t EMS_IsReleaseCleanupPending(void)
 void EMS_CompleteReleaseCleanup(void)
 {
   ems_release_cleanup_pending = 0U;
+  ems_usb_cleanup_pending = 0U;
 }
 
 /**
@@ -433,11 +443,13 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
     {
       ems_stop_active = 1U;
       ems_release_cleanup_pending = 0U;
+      ems_usb_cleanup_pending = 0U;
     }
     else
     {
       ems_stop_active = 0U;
       ems_release_cleanup_pending = 1U;
+      ems_usb_cleanup_pending = 1U;
     }
   }
 }

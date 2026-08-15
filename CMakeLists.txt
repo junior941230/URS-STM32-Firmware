@@ -44,6 +44,7 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 
 # Add sources to executable
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
+    Core/Src/machine_state.c
     Core/Src/motor_can.c
     Core/Src/usb_command.c
     USB_DEVICE/App/usb_device.c
