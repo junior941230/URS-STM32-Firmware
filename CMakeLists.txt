@@ -46,26 +46,8 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/machine_state.c
     Core/Src/motor_can.c
-    Core/Src/usb_command.c
-    USB_DEVICE/App/usb_device.c
-    USB_DEVICE/App/usbd_desc.c
-    USB_DEVICE/App/usbd_cdc_if.c
-    USB_DEVICE/Target/usbd_conf.c
-    Middlewares/ST/STM32_USB_Device_Library/Core/Src/usbd_core.c
-    Middlewares/ST/STM32_USB_Device_Library/Core/Src/usbd_ctlreq.c
-    Middlewares/ST/STM32_USB_Device_Library/Core/Src/usbd_ioreq.c
-    Middlewares/ST/STM32_USB_Device_Library/Class/CDC/Src/usbd_cdc.c
-    Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_pcd.c
-    Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_pcd_ex.c
-    Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_ll_usb.c
-)
-
-# Add include paths
-target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
-    USB_DEVICE/App
-    USB_DEVICE/Target
-    Middlewares/ST/STM32_USB_Device_Library/Core/Inc
-    Middlewares/ST/STM32_USB_Device_Library/Class/CDC/Inc
+    Core/Src/serial_command.c
+    Core/Src/ssd1306_status.c
 )
 
 # Add project symbols (macros)

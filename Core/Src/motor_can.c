@@ -52,16 +52,32 @@
 #define MOTOR_CAN_INIT_SMALL_COUNT 6U
 #define MOTOR_CAN_INIT_TARGET_COUNT 12U
 #define MOTOR_CAN_INIT_HOME_DIRECTION 0U
-#define MOTOR_CAN_INIT_HIGH_SPEED_RPM 60U
+#define MOTOR_CAN_INIT_HIGH_SPEED_RPM 30U
 #define MOTOR_CAN_INIT_LOW_SPEED_RPM 10U
-#define MOTOR_CAN_INIT_BIG_MOTOR_OFFSET_ANGLE_DEGREES 0.0
-#define MOTOR_CAN_INIT_SMALL_MOTOR_OFFSET_ANGLE_DEGREES 0.0
+#define MOTOR_CAN_INIT_FOLLOWER_SPEED_RPM (MOTOR_CAN_INIT_HIGH_SPEED_RPM / 2U)
+#define MOTOR_CAN_INIT_FOLLOWER_OFFSET_SPEED_RPM                               \
+  (MOTOR_CAN_INIT_LOW_SPEED_RPM / 2U)
+#define MOTOR_CAN_INIT_TARGET_ACCELERATION 130U
+#define MOTOR_CAN_INIT_FOLLOWER_ACCELERATION 4U
+#define MOTOR_CAN_INIT_BIG_MOTOR_OFFSET_ANGLE_DEGREES 8.0
+#define MOTOR_CAN_INIT_SMALL_MOTOR_OFFSET_ANGLE_DEGREES -10
 #define MOTOR_CAN_INIT_HOME_TIMEOUT_MS 15000U
 #define MOTOR_CAN_INIT_QUEUE_TIMEOUT_MS 3000U
+#define MOTOR_CAN_INIT_IO_RESPONSE_TIMEOUT_MS 800U
+#define MOTOR_CAN_INIT_IO_POLL_INTERVAL_MS 10U
+#define MOTOR_CAN_INIT_STOP_POLL_INTERVAL_MS 5U
+#define MOTOR_CAN_INIT_SWITCH_STABLE_SAMPLES 3U
+#define MOTOR_CAN_HOME_SWITCH_IN1_MASK 0x01U
+#define MOTOR_CAN_HOME_SWITCH_ACTIVE_LEVEL 0U
+#define MOTOR_CAN_INIT_STOPPED_BIG_MASK 0x01U
+#define MOTOR_CAN_INIT_STOPPED_FOLLOWER_MASK 0x02U
+#define MOTOR_CAN_INIT_STOPPED_PAIR_MASK                                       \
+  (MOTOR_CAN_INIT_STOPPED_BIG_MASK | MOTOR_CAN_INIT_STOPPED_FOLLOWER_MASK)
 
 /* ROTATE 會分批排入 TX FIFO，並依手冊以約 1 ms 間隔重送同步觸發。 */
 #define MOTOR_CAN_ROTATE_QUEUE_TIMEOUT_MS 2000U
-#define MOTOR_CAN_ROTATE_TIMEOUT_GUARD_MS 1000U
+#define MOTOR_CAN_ROTATE_STATUS_POLL_INITIAL_DELAY_MS 10U
+#define MOTOR_CAN_ROTATE_STATUS_POLL_INTERVAL_MS 5U
 #define MOTOR_CAN_SYNC_REPEAT_INTERVAL_MS 1U
 #define MOTOR_CAN_SYNC_TRIGGER_COUNT 3U
 
@@ -128,14 +144,16 @@ typedef enum {
   MOTOR_STATE_HOME_WAIT_EXECUTE,
   MOTOR_STATE_HOME_WAIT_SET_ZERO,
 
-  /* INIT：big motor 設定完成後跨兩條 bus 同步 homing，再逐顆處理 small motor。
-   */
+  /* INIT：small/big 都由 STM32 找原點；big 階段才同步 small follower。 */
+  MOTOR_STATE_INIT_BIG_WAIT_SWITCH,
   MOTOR_STATE_INIT_BIG_SYNC_ENABLE,
-  MOTOR_STATE_INIT_BIG_QUEUE_HOME,
+  MOTOR_STATE_INIT_BIG_QUEUE_SPEED,
   MOTOR_STATE_INIT_BIG_SYNC_TRIGGER,
   MOTOR_STATE_INIT_BIG_REPEAT_SYNC_TRIGGER,
   MOTOR_STATE_INIT_BIG_DISABLE_SYNC,
-  MOTOR_STATE_INIT_BIG_WAIT_HOME,
+  MOTOR_STATE_INIT_BIG_WAIT_STOP,
+  MOTOR_STATE_INIT_BIG_SET_ZERO,
+  MOTOR_STATE_INIT_BIG_WAIT_SET_ZERO,
 
   /* ROTATE：啟用 Synchronization mark、排入各馬達命令、同步觸發並等待完成。 */
   MOTOR_STATE_ROTATE_QUEUE_SYNC_ENABLE,
@@ -164,8 +182,19 @@ typedef enum {
   MOTOR_INIT_PHASE_CONFIG_SMALL,
   MOTOR_INIT_PHASE_HOME_SMALL,
   MOTOR_INIT_PHASE_POST_OFFSET_BIG,
-  MOTOR_INIT_PHASE_POST_OFFSET_SMALL
+  MOTOR_INIT_PHASE_POST_OFFSET_SMALL,
+  MOTOR_INIT_PHASE_RESET_SMALL,
+  MOTOR_INIT_PHASE_POST_RESET_SMALL
 } MotorCAN_InitPhase;
+
+typedef enum {
+  MOTOR_INIT_HOME_PHASE_NONE = 0,
+  MOTOR_INIT_HOME_PHASE_CHECK_INITIAL_SWITCH,
+  MOTOR_INIT_HOME_PHASE_SEARCH_FAST,
+  MOTOR_INIT_HOME_PHASE_RELEASE_SLOW,
+  MOTOR_INIT_HOME_PHASE_LATCH_SLOW,
+  MOTOR_INIT_HOME_PHASE_STOP
+} MotorCAN_InitHomePhase;
 
 typedef struct {
   uint8_t bus;
@@ -200,28 +229,37 @@ typedef struct {
   uint32_t home_timeout_ms;
   uint32_t home_status_poll_deadline;
 
-  /* INIT 先存六顆 big，再存六顆 small；設定與執行均由同一 state machine 推進。
+  /* INIT 先存六顆 big，再存六顆 small；執行順序是 small、big、small reset。
    */
   MotorCAN_InitTarget init_targets[MOTOR_CAN_INIT_TARGET_COUNT];
   MotorCAN_InitPhase init_phase;
+  MotorCAN_InitHomePhase init_home_phase;
   uint8_t init_target_index;
   uint8_t init_bus_mask;
   uint8_t init_sync_bus;
   uint8_t init_sync_trigger_count;
+  uint8_t init_queue_step;
   uint8_t init_poll_index;
+  uint8_t init_home_switch_stable_count;
+  uint8_t init_stopped_pair_mask;
   uint16_t init_completed_mask;
   uint16_t post_offset_target_mask;
   uint8_t post_offset_zero_index;
   uint32_t init_queue_deadline;
+  uint32_t init_home_deadline;
 
   /* ROTATE 的 machine-state 規劃與非阻塞同步排程進度。 */
   MachineMotionPlan rotate_plan;
   uint8_t rotate_stage_index;
   uint8_t rotate_next_motion;
+  uint8_t rotate_bus_mask;
+  uint8_t rotate_sync_bus;
   uint8_t rotate_sync_trigger_count;
+  uint8_t rotate_poll_index;
   uint16_t rotate_completed_mask;
   uint32_t rotate_max_motion_ms;
   uint32_t rotate_queue_deadline;
+  uint32_t rotate_status_poll_deadline;
 
   /* 絕對 tick deadline；用 signed subtraction 比較以安全跨越 uint32_t
    * overflow。 */
@@ -259,7 +297,14 @@ static uint8_t motor_event_tail;
 
 static void MotorCAN_SendOrFail(uint8_t sent, MotorCAN_State next_state,
                                 uint32_t timeout_ms);
-static void MotorCAN_BeginInitSmallHoming(void);
+static void MotorCAN_FailOperation(MotorCAN_Error error, uint8_t stop_motion);
+static void MotorCAN_BeginInitTarget(uint8_t target_index);
+static void MotorCAN_BeginInitHomeTarget(uint8_t target_index,
+                                         MotorCAN_InitPhase phase);
+static void MotorCAN_MarkInitBigComplete(uint8_t index);
+static void MotorCAN_BeginInitBigConfiguration(void);
+static void MotorCAN_BeginInitSmallReset(void);
+static uint8_t MotorCAN_IsInitHomeState(void);
 
 /**
  * @brief 驗證對外使用的 CAN bus 編號。
@@ -283,11 +328,9 @@ static uint8_t MotorCAN_IsValidNodeId(uint16_t id) {
 
 /** @brief 檢查 homing offset 角度是否能轉成 Servo42D 的位置單位。 */
 static uint8_t MotorCAN_HomeOffsetAngleIsValid(double angle_degrees) {
-  const double minimum_angle =
-      180.0 / MOTOR_CAN_ENCODER_COUNTS_PER_REVOLUTION;
-  const double maximum_angle =
-      (double)MOTOR_CAN_MAX_RELATIVE_AXIS_COUNTS * 360.0 /
-      MOTOR_CAN_ENCODER_COUNTS_PER_REVOLUTION;
+  const double minimum_angle = 180.0 / MOTOR_CAN_ENCODER_COUNTS_PER_REVOLUTION;
+  const double maximum_angle = (double)MOTOR_CAN_MAX_RELATIVE_AXIS_COUNTS *
+                               360.0 / MOTOR_CAN_ENCODER_COUNTS_PER_REVOLUTION;
 
   if ((angle_degrees != angle_degrees) || (angle_degrees > maximum_angle) ||
       (angle_degrees < -maximum_angle)) {
@@ -296,8 +339,7 @@ static uint8_t MotorCAN_HomeOffsetAngleIsValid(double angle_degrees) {
   if (angle_degrees == 0.0) {
     return 1U;
   }
-  return ((angle_degrees >= minimum_angle) ||
-          (angle_degrees <= -minimum_angle))
+  return ((angle_degrees >= minimum_angle) || (angle_degrees <= -minimum_angle))
              ? 1U
              : 0U;
 }
@@ -535,7 +577,8 @@ static void MotorCAN_PushError(MotorCAN_Error error) {
   event.new_id = motor_context.new_id;
   if (motor_context.operation == MOTOR_CAN_OPERATION_INIT) {
     event.completed_mask = motor_context.init_completed_mask;
-    if (motor_context.init_phase == MOTOR_INIT_PHASE_HOME_BIG) {
+    if ((motor_context.init_phase == MOTOR_INIT_PHASE_HOME_BIG) &&
+        MotorCAN_IsInitHomeState()) {
       event.missing_mask =
           (uint16_t)(((1UL << MOTOR_CAN_INIT_BIG_COUNT) - 1UL) &
                      ~motor_context.init_completed_mask);
@@ -767,9 +810,36 @@ static uint8_t MotorCAN_SendExecuteHome(uint8_t bus, uint16_t id) {
   return MotorCAN_SendBody(bus, id, body, sizeof(body));
 }
 
+/** @brief 以 F6H 啟動或停止 continuous speed；dir 定義為 0=CCW、1=CW。 */
+static uint8_t MotorCAN_SendContinuousSpeed(uint8_t bus, uint16_t id,
+                                            uint8_t direction,
+                                            uint16_t speed_rpm,
+                                            uint8_t acceleration) {
+  const uint8_t body[] = {
+      0xF6U, (uint8_t)(((direction & 0x01U) << 7) | ((speed_rpm >> 8) & 0x0FU)),
+      (uint8_t)(speed_rpm & 0xFFU), acceleration};
+
+  if ((direction > 1U) || (speed_rpm > 3000U)) {
+    return 0U;
+  }
+  return MotorCAN_SendBody(bus, id, body, sizeof(body));
+}
+
 /** @brief 讀取單圈與非單圈 homing 狀態；origin homing 使用回覆的 status2。 */
 static uint8_t MotorCAN_SendReadHomeStatus(uint8_t bus, uint16_t id) {
   const uint8_t body[] = {0x3BU};
+  return MotorCAN_SendBody(bus, id, body, sizeof(body));
+}
+
+/** @brief Read Servo42ES IO status; IN_1 is bit 0 in the returned status. */
+static uint8_t MotorCAN_SendReadIoStatus(uint8_t bus, uint16_t id) {
+  const uint8_t body[] = {0x34U};
+  return MotorCAN_SendBody(bus, id, body, sizeof(body));
+}
+
+/** @brief 主動查詢馬達是否仍在運轉；CanRSP 關閉時 F1 仍會回覆。 */
+static uint8_t MotorCAN_SendReadMotorStatus(uint8_t bus, uint16_t id) {
+  const uint8_t body[] = {0xF1U};
   return MotorCAN_SendBody(bus, id, body, sizeof(body));
 }
 
@@ -887,6 +957,49 @@ static uint8_t MotorCAN_IsMotionOperation(void) {
              : 0U;
 }
 
+/** @brief 判斷 state machine 是否正在處理一組 ROTATE synchronization stage。 */
+static uint8_t MotorCAN_IsRotateStageState(void) {
+  switch (motor_context.state) {
+  case MOTOR_STATE_ROTATE_QUEUE_SYNC_ENABLE:
+  case MOTOR_STATE_ROTATE_QUEUE_MOTIONS:
+  case MOTOR_STATE_ROTATE_QUEUE_SYNC_TRIGGER:
+  case MOTOR_STATE_ROTATE_REPEAT_SYNC_TRIGGER:
+  case MOTOR_STATE_ROTATE_DISABLE_SYNC:
+  case MOTOR_STATE_ROTATE_WAIT_RUN:
+    return 1U;
+  default:
+    return 0U;
+  }
+}
+
+/** @brief Return 1 while STM32-controlled INIT homing is active. */
+static uint8_t MotorCAN_IsInitHomeState(void) {
+  switch (motor_context.state) {
+  case MOTOR_STATE_INIT_BIG_WAIT_SWITCH:
+  case MOTOR_STATE_INIT_BIG_SYNC_ENABLE:
+  case MOTOR_STATE_INIT_BIG_QUEUE_SPEED:
+  case MOTOR_STATE_INIT_BIG_SYNC_TRIGGER:
+  case MOTOR_STATE_INIT_BIG_REPEAT_SYNC_TRIGGER:
+  case MOTOR_STATE_INIT_BIG_DISABLE_SYNC:
+  case MOTOR_STATE_INIT_BIG_WAIT_STOP:
+  case MOTOR_STATE_INIT_BIG_SET_ZERO:
+  case MOTOR_STATE_INIT_BIG_WAIT_SET_ZERO:
+    return 1U;
+  default:
+    return 0U;
+  }
+}
+
+/** @brief 判斷目前 ROTATE stage 是否包含指定 CAN bus。 */
+static uint8_t MotorCAN_RotateStageUsesBus(uint8_t bus) {
+  if ((!MotorCAN_IsValidBus(bus)) || (!MotorCAN_IsRotateStageState())) {
+    return 0U;
+  }
+  return (motor_context.rotate_bus_mask & (uint8_t)(1U << (bus - 1U))) != 0U
+             ? 1U
+             : 0U;
+}
+
 /**
  * @brief EMS 啟動時停止並 Disable 兩條 bus 上的所有馬達。
  * @retval 1 表示兩條 bus 都已排入安全命令；0 表示仍需重試。
@@ -946,12 +1059,21 @@ static void MotorCAN_StopActiveMotion(uint8_t emergency) {
 
   if (motor_context.operation == MOTOR_CAN_OPERATION_ROTATE) {
     const uint8_t emergency_stop[] = {0xF7U};
+    uint8_t bus;
+    uint8_t bus_mask = motor_context.rotate_bus_mask;
 
-    /* ROTATE 可能含多顆馬達；broadcast 可在 TX FIFO 有限時立即停止整條 bus。 */
-    (void)MotorCAN_SendSynchronizationEnable(motor_context.bus, 0U);
-    (void)MotorCAN_SendBody(motor_context.bus, 0U, emergency_stop,
-                            sizeof(emergency_stop));
-    (void)MotorCAN_SendEnable(motor_context.bus, 0U, 0U);
+    if ((bus_mask == 0U) && MotorCAN_IsValidBus(motor_context.bus)) {
+      bus_mask = (uint8_t)(1U << (motor_context.bus - 1U));
+    }
+    /* 跨 bus stage 發生錯誤或 EMS 時，所有參與的 bus 都必須停止並 Disable。 */
+    for (bus = 1U; bus <= MOTOR_CAN_BUS_COUNT; bus++) {
+      if ((bus_mask & (uint8_t)(1U << (bus - 1U))) == 0U) {
+        continue;
+      }
+      (void)MotorCAN_SendSynchronizationEnable(bus, 0U);
+      (void)MotorCAN_SendBody(bus, 0U, emergency_stop, sizeof(emergency_stop));
+      (void)MotorCAN_SendEnable(bus, 0U, 0U);
+    }
     return;
   }
 
@@ -1085,7 +1207,7 @@ static void MotorCAN_CompleteHome(void) {
   MotorCAN_ResetOperation();
 }
 
-/** @brief 全部 big/small motor homing 完成後解鎖一般運動指令。 */
+/** @brief 全部 small/big motor homing 完成後解鎖一般運動指令。 */
 static void MotorCAN_CompleteInit(void) {
   MotorCAN_Event event = {0};
 
@@ -1095,15 +1217,16 @@ static void MotorCAN_CompleteInit(void) {
   MotorCAN_ResetOperation();
 }
 
-/** @brief 回報一顆同步 big motor 已送出 homing 完成狀態。 */
-static void MotorCAN_ReportInitBigProgress(const MotorCAN_RxFrame *frame) {
+/** @brief 回報一顆 big motor 的 homing 與 offset 都已完成。 */
+static void MotorCAN_ReportInitBigProgress(uint8_t index) {
+  const MotorCAN_InitTarget *target = &motor_context.init_targets[index];
   MotorCAN_Event event = {0};
   uint16_t completed = motor_context.init_completed_mask;
 
   event.type = MOTOR_CAN_EVENT_INIT_BIG_PROGRESS;
   event.operation = MOTOR_CAN_OPERATION_INIT;
-  event.bus = frame->bus;
-  event.id = frame->id;
+  event.bus = target->bus;
+  event.id = target->id;
   event.completed_mask = completed;
   while (completed != 0U) {
     event.completed_count =
@@ -1113,24 +1236,12 @@ static void MotorCAN_ReportInitBigProgress(const MotorCAN_RxFrame *frame) {
   MotorCAN_PushEvent(&event);
 }
 
-/** @brief 將 timeout 的錯誤目標改成第一顆尚未完成的 big motor。 */
-static void MotorCAN_SelectFirstMissingInitBigTarget(void) {
-  uint8_t index;
-
-  for (index = 0U; index < MOTOR_CAN_INIT_BIG_COUNT; index++) {
-    if ((motor_context.init_completed_mask & (uint16_t)(1UL << index)) == 0U) {
-      motor_context.bus = motor_context.init_targets[index].bus;
-      motor_context.id = motor_context.init_targets[index].id;
-      return;
-    }
-  }
-}
-
 /** @brief 完成同步 ROTATE，提交 machine state 並產生完成事件。 */
 static void MotorCAN_CompleteRotate(void) {
   MotorCAN_Event event = {0};
 
-  MachineState_CommitRotate(motor_context.rotate_plan.command);
+  MachineState_CommitRotate(motor_context.rotate_plan.command,
+                            motor_context.rotate_plan.command_multiplier);
   event.type = MOTOR_CAN_EVENT_ROTATE_FINISHED;
   event.bus = motor_context.bus;
   event.id = motor_context.id;
@@ -1170,10 +1281,10 @@ static uint8_t MotorCAN_BuildHomePostOffsetPlan(uint8_t bus, uint16_t id,
   return 1U;
 }
 
-/** @brief 建立指定 INIT 馬達群組的負 offset 動作，同一 bus 使用同步標記。 */
+/** @brief 建立 INIT 的 offset 動作；big/small 的正負角度都由 F4 套用。 */
 static uint8_t MotorCAN_BuildInitPostOffsetPlan(uint8_t first_target,
                                                 uint8_t target_count) {
-  uint8_t bus;
+  uint8_t target_index;
   const uint8_t last_target = (uint8_t)(first_target + target_count);
 
   memset(&motor_context.rotate_plan, 0, sizeof(motor_context.rotate_plan));
@@ -1182,39 +1293,79 @@ static uint8_t MotorCAN_BuildInitPostOffsetPlan(uint8_t first_target,
       (last_target > MOTOR_CAN_INIT_TARGET_COUNT)) {
     return 0U;
   }
-  for (bus = 1U; bus <= MOTOR_CAN_BUS_COUNT; bus++) {
-    uint8_t target_index;
-    uint8_t stage_index = 0U;
-    uint8_t stage_added = 0U;
+  for (target_index = first_target; target_index < last_target;
+       target_index++) {
+    const MotorCAN_InitTarget *target =
+        &motor_context.init_targets[target_index];
+    const double target_angle =
+        MotorCAN_HomePostOffsetRotateAngle(target->offset_angle_degrees);
+    uint8_t stage_index;
 
-    for (target_index = first_target; target_index < last_target;
-         target_index++) {
-      const MotorCAN_InitTarget *target =
-          &motor_context.init_targets[target_index];
+    if (target->offset_angle_degrees == 0.0) {
+      continue;
+    }
+    if (MachineState_PlanAddStage(&motor_context.rotate_plan, &stage_index) !=
+        MACHINE_PLAN_OK) {
+      return 0U;
+    }
+    if (target_index < MOTOR_CAN_INIT_BIG_COUNT) {
+      const MotorCAN_InitTarget *follower =
+          &motor_context.init_targets[MOTOR_CAN_INIT_BIG_COUNT + target_index];
 
-      if ((target->bus != bus) || (target->offset_angle_degrees >= 0.0)) {
-        continue;
-      }
-      if (!stage_added) {
-        if (MachineState_PlanAddStage(&motor_context.rotate_plan,
-                                      &stage_index) != MACHINE_PLAN_OK) {
-          return 0U;
-        }
-        stage_added = 1U;
-      }
-      if (MachineState_PlanAddMotion(
-              &motor_context.rotate_plan, stage_index, target->bus, target->id,
-              MOTOR_CAN_INIT_LOW_SPEED_RPM,
-              MOTOR_CAN_HOME_OFFSET_ACCELERATION,
-              MotorCAN_HomePostOffsetRotateAngle(
-                  target->offset_angle_degrees)) != MACHINE_PLAN_OK) {
+      /* FaceModule_Macro：small 的速度與角度都是 big 的一半。 */
+      if ((follower->bus != target->bus) ||
+          (MachineState_PlanAddMotion(&motor_context.rotate_plan, stage_index,
+                                      follower->bus, follower->id,
+                                      MOTOR_CAN_INIT_FOLLOWER_OFFSET_SPEED_RPM,
+                                      MOTOR_CAN_INIT_FOLLOWER_ACCELERATION,
+                                      target_angle * 0.5) != MACHINE_PLAN_OK)) {
         return 0U;
       }
-      motor_context.post_offset_target_mask |=
-          (uint16_t)(1UL << target_index);
     }
+    if (MachineState_PlanAddMotion(
+            &motor_context.rotate_plan, stage_index, target->bus, target->id,
+            MOTOR_CAN_INIT_LOW_SPEED_RPM, MOTOR_CAN_HOME_OFFSET_ACCELERATION,
+            target_angle) != MACHINE_PLAN_OK) {
+      return 0U;
+    }
+    motor_context.post_offset_target_mask |= (uint16_t)(1UL << target_index);
   }
   return 1U;
+}
+
+/** @brief 完成單顆 INIT offset 後，推進到下一顆或下一個 homing 群組。 */
+static void MotorCAN_AdvanceAfterInitPostOffset(void) {
+  const uint8_t next_target = (uint8_t)(motor_context.init_target_index + 1U);
+
+  switch (motor_context.init_phase) {
+  case MOTOR_INIT_PHASE_POST_OFFSET_SMALL:
+    if (next_target < MOTOR_CAN_INIT_TARGET_COUNT) {
+      motor_context.init_phase = MOTOR_INIT_PHASE_CONFIG_SMALL;
+      MotorCAN_BeginInitTarget(next_target);
+    } else {
+      MotorCAN_BeginInitBigConfiguration();
+    }
+    break;
+  case MOTOR_INIT_PHASE_POST_OFFSET_BIG:
+    MotorCAN_MarkInitBigComplete(motor_context.init_target_index);
+    if (next_target < MOTOR_CAN_INIT_BIG_COUNT) {
+      motor_context.init_phase = MOTOR_INIT_PHASE_CONFIG_BIG;
+      MotorCAN_BeginInitTarget(next_target);
+    } else {
+      MotorCAN_BeginInitSmallReset();
+    }
+    break;
+  case MOTOR_INIT_PHASE_POST_RESET_SMALL:
+    if (next_target < MOTOR_CAN_INIT_TARGET_COUNT) {
+      MotorCAN_BeginInitHomeTarget(next_target, MOTOR_INIT_PHASE_RESET_SMALL);
+    } else {
+      MotorCAN_CompleteInit();
+    }
+    break;
+  default:
+    MotorCAN_FailOperation(MOTOR_CAN_ERROR_DEVICE_REJECTED, 1U);
+    break;
+  }
 }
 
 /** @brief 重設目前 stage 的追蹤資料，準備送出該組 Synchronization mark。 */
@@ -1225,11 +1376,17 @@ static void MotorCAN_BeginRotateStage(uint32_t now) {
 
   motor_context.bus = stage->motions[0].bus;
   motor_context.rotate_next_motion = 0U;
+  motor_context.rotate_bus_mask = 0U;
+  motor_context.rotate_sync_bus = 0U;
   motor_context.rotate_sync_trigger_count = 0U;
+  motor_context.rotate_poll_index = 0U;
   motor_context.rotate_completed_mask = 0U;
   motor_context.rotate_max_motion_ms = 0U;
+  motor_context.rotate_status_poll_deadline = 0U;
   for (index = 0U; index < stage->motion_count; index++) {
     uint32_t motion_ms = MotorCAN_EstimateAngleMotionMs(&stage->motions[index]);
+    motor_context.rotate_bus_mask |=
+        (uint8_t)(1U << (stage->motions[index].bus - 1U));
     if (motion_ms > motor_context.rotate_max_motion_ms) {
       motor_context.rotate_max_motion_ms = motion_ms;
     }
@@ -1238,13 +1395,13 @@ static void MotorCAN_BeginRotateStage(uint32_t now) {
   motor_context.rotate_queue_deadline = now + MOTOR_CAN_ROTATE_QUEUE_TIMEOUT_MS;
 }
 
-/** @brief 負 offset rotate 完成後，逐顆把目前位置設為新零點。 */
+/** @brief offset rotate 完成後，逐顆把目前位置設為新零點。 */
 static void MotorCAN_BeginNextPostOffsetZero(void) {
   if (motor_context.operation == MOTOR_CAN_OPERATION_HOME) {
-    MotorCAN_SendOrFail(
-        MotorCAN_SendSetCurrentPositionZero(motor_context.bus,
-                                            motor_context.id),
-        MOTOR_STATE_HOME_WAIT_SET_ZERO, MOTOR_CAN_COMMAND_TIMEOUT_MS);
+    MotorCAN_SendOrFail(MotorCAN_SendSetCurrentPositionZero(motor_context.bus,
+                                                            motor_context.id),
+                        MOTOR_STATE_HOME_WAIT_SET_ZERO,
+                        MOTOR_CAN_COMMAND_TIMEOUT_MS);
     return;
   }
 
@@ -1268,11 +1425,7 @@ static void MotorCAN_BeginNextPostOffsetZero(void) {
           MOTOR_STATE_HOME_WAIT_SET_ZERO, MOTOR_CAN_COMMAND_TIMEOUT_MS);
       return;
     }
-    if (motor_context.init_phase == MOTOR_INIT_PHASE_POST_OFFSET_BIG) {
-      MotorCAN_BeginInitSmallHoming();
-    } else {
-      MotorCAN_CompleteInit();
-    }
+    MotorCAN_AdvanceAfterInitPostOffset();
   }
 }
 
@@ -1341,8 +1494,8 @@ static void MotorCAN_SendOrFail(uint8_t sent, MotorCAN_State next_state,
   motor_context.deadline = HAL_GetTick() + timeout_ms;
 }
 
-/** @brief 載入 INIT 目標並從 version probe 開始套用 HOME 設定。 */
-static void MotorCAN_BeginInitTarget(uint8_t target_index) {
+/** @brief 將一顆 INIT 目標載入共用 HOME context。 */
+static void MotorCAN_SelectInitTarget(uint8_t target_index) {
   const MotorCAN_InitTarget *target = &motor_context.init_targets[target_index];
 
   motor_context.init_target_index = target_index;
@@ -1350,92 +1503,134 @@ static void MotorCAN_BeginInitTarget(uint8_t target_index) {
   motor_context.id = target->id;
   motor_context.home_direction = target->direction;
   motor_context.home_offset_angle_degrees = target->offset_angle_degrees;
-  motor_context.home_origin_offset_counts =
-      MotorCAN_HomeOffsetAngleToCounts(target->offset_angle_degrees);
+  /* INIT 由 STM32 控制 homing；0x94 不再承擔正 offset。 */
+  motor_context.home_origin_offset_counts = 0U;
+}
+
+/** @brief 載入 INIT 目標並從 version probe 開始套用 HOME 設定。 */
+static void MotorCAN_BeginInitTarget(uint8_t target_index) {
+  const MotorCAN_InitTarget *target = &motor_context.init_targets[target_index];
+
+  MotorCAN_SelectInitTarget(target_index);
   MotorCAN_SendOrFail(MotorCAN_SendReadVersion(target->bus, target->id),
                       MOTOR_STATE_HOME_PROBE, MOTOR_CAN_PROBE_TIMEOUT_MS);
 }
 
-/** @brief 從 after_bus 之後尋找下一條有 INIT 馬達的 bus；0 表示沒有。 */
+/** @brief 取得目前 big/small 同步 homing 所在的 bus；0 表示已處理。 */
 static uint8_t MotorCAN_InitNextUsedBus(uint8_t after_bus) {
   uint8_t bus;
 
+  if (motor_context.init_target_index >= MOTOR_CAN_INIT_TARGET_COUNT) {
+    return 0U;
+  }
+  bus = motor_context.init_targets[motor_context.init_target_index].bus;
+  return (after_bus < bus) ? bus : 0U;
+}
+
+/** @brief 開始一顆由 STM32 控制的 INIT homing。 */
+static void MotorCAN_BeginInitHomeTarget(uint8_t target_index,
+                                         MotorCAN_InitPhase phase) {
+  const uint32_t now = HAL_GetTick();
+  const uint8_t is_big = target_index < MOTOR_CAN_INIT_BIG_COUNT ? 1U : 0U;
+  const uint8_t valid_phase = ((phase == MOTOR_INIT_PHASE_HOME_BIG) ||
+                               (phase == MOTOR_INIT_PHASE_HOME_SMALL) ||
+                               (phase == MOTOR_INIT_PHASE_RESET_SMALL))
+                                  ? 1U
+                                  : 0U;
+
+  if ((!valid_phase) || (target_index >= MOTOR_CAN_INIT_TARGET_COUNT) ||
+      ((phase == MOTOR_INIT_PHASE_HOME_BIG) && (!is_big)) ||
+      (((phase == MOTOR_INIT_PHASE_HOME_SMALL) ||
+        (phase == MOTOR_INIT_PHASE_RESET_SMALL)) &&
+       is_big)) {
+    MotorCAN_FailOperation(MOTOR_CAN_ERROR_DEVICE_REJECTED, 1U);
+    return;
+  }
+
+  MotorCAN_SelectInitTarget(target_index);
+  motor_context.init_phase = phase;
+  if (phase == MOTOR_INIT_PHASE_RESET_SMALL) {
+    motor_context.home_direction ^= 1U;
+  }
+  motor_context.init_home_phase = MOTOR_INIT_HOME_PHASE_CHECK_INITIAL_SWITCH;
+  motor_context.init_home_switch_stable_count = 0U;
+  motor_context.init_stopped_pair_mask = 0U;
+  motor_context.init_poll_index = 0U;
+  motor_context.state = MOTOR_STATE_INIT_BIG_WAIT_SWITCH;
+  motor_context.init_home_deadline =
+      now + motor_context.home_timeout_ms + MOTOR_CAN_HOME_TIMEOUT_GUARD_MS;
+  motor_context.deadline = motor_context.init_home_deadline;
+  motor_context.home_status_poll_deadline = now;
+  motor_context.init_queue_deadline =
+      now + MOTOR_CAN_INIT_IO_RESPONSE_TIMEOUT_MS;
+}
+
+/** @brief 從 after_bus 之後尋找目前 ROTATE stage 使用的下一條 bus。 */
+static uint8_t MotorCAN_RotateNextUsedBus(uint8_t after_bus) {
+  uint8_t bus;
+
   for (bus = (uint8_t)(after_bus + 1U); bus <= MOTOR_CAN_BUS_COUNT; bus++) {
-    if ((motor_context.init_bus_mask & (uint8_t)(1U << (bus - 1U))) != 0U) {
+    if ((motor_context.rotate_bus_mask & (uint8_t)(1U << (bus - 1U))) != 0U) {
       return bus;
     }
   }
   return 0U;
 }
 
-/** @brief 六顆 big motor 都設定完成後，開始跨 bus 的同步 homing 排程。 */
-static void MotorCAN_BeginInitBigHoming(uint32_t now) {
-  motor_context.init_phase = MOTOR_INIT_PHASE_HOME_BIG;
-  motor_context.init_target_index = 0U;
-  motor_context.init_sync_bus = 0U;
-  motor_context.init_sync_trigger_count = 0U;
-  motor_context.init_poll_index = 0U;
-  motor_context.init_completed_mask = 0U;
-  motor_context.state = MOTOR_STATE_INIT_BIG_SYNC_ENABLE;
-  motor_context.init_queue_deadline = now + MOTOR_CAN_INIT_QUEUE_TIMEOUT_MS;
+/** @brief small motor 全數完成後，從第一顆 big motor 開始套用 homing 設定。 */
+static void MotorCAN_BeginInitBigConfiguration(void) {
+  motor_context.init_phase = MOTOR_INIT_PHASE_CONFIG_BIG;
+  MotorCAN_BeginInitTarget(0U);
 }
 
-/** @brief big motor 全數完成後，從第一顆 small motor 開始逐顆 homing。 */
-static void MotorCAN_BeginInitSmallHoming(void) {
-  motor_context.init_phase = MOTOR_INIT_PHASE_CONFIG_SMALL;
-  MotorCAN_BeginInitTarget(MOTOR_CAN_INIT_BIG_COUNT);
+/** @brief big homing/offset 全部完成後，重新逐顆 homing small motor。 */
+static void MotorCAN_BeginInitSmallReset(void) {
+  MotorCAN_BeginInitHomeTarget(MOTOR_CAN_INIT_BIG_COUNT,
+                               MOTOR_INIT_PHASE_RESET_SMALL);
 }
 
-/** @brief 對指定 INIT 群組套用負 offset；沒有負角度時直接推進下一階段。 */
+/** @brief 對指定 INIT 群組套用 signed-angle offset；零角度直接推進。 */
 static void MotorCAN_BeginInitPostOffset(uint8_t first_target,
                                          uint8_t target_count,
                                          MotorCAN_InitPhase phase) {
+  motor_context.init_phase = phase;
   if (!MotorCAN_BuildInitPostOffsetPlan(first_target, target_count)) {
     MotorCAN_FailOperation(MOTOR_CAN_ERROR_TX, 1U);
     return;
   }
   if (motor_context.rotate_plan.stage_count == 0U) {
-    if (phase == MOTOR_INIT_PHASE_POST_OFFSET_BIG) {
-      MotorCAN_BeginInitSmallHoming();
-    } else {
-      MotorCAN_CompleteInit();
-    }
+    MotorCAN_AdvanceAfterInitPostOffset();
     return;
   }
 
-  motor_context.init_phase = phase;
   motor_context.rotate_stage_index = 0U;
   MotorCAN_BeginRotateStage(HAL_GetTick());
 }
 
-/** @brief 記錄一顆 big motor 完成，並在六顆都完成後開始 small motor。 */
-static void MotorCAN_MarkInitBigComplete(uint8_t index,
-                                         const MotorCAN_RxFrame *frame) {
+/** @brief 記錄目前 big motor 的 homing 與 offset 已完成。 */
+static void MotorCAN_MarkInitBigComplete(uint8_t index) {
   const uint16_t completed_bit = (uint16_t)(1UL << index);
 
   if ((motor_context.init_completed_mask & completed_bit) == 0U) {
     motor_context.init_completed_mask |= completed_bit;
-    MotorCAN_ReportInitBigProgress(frame);
-  }
-  if ((motor_context.state == MOTOR_STATE_INIT_BIG_WAIT_HOME) &&
-      (motor_context.init_completed_mask ==
-       (uint16_t)((1UL << MOTOR_CAN_INIT_BIG_COUNT) - 1UL))) {
-    MotorCAN_BeginInitPostOffset(0U, MOTOR_CAN_INIT_BIG_COUNT,
-                                 MOTOR_INIT_PHASE_POST_OFFSET_BIG);
+    MotorCAN_ReportInitBigProgress(index);
   }
 }
 
-/** @brief 完成目前單顆 homing，推進下一顆 small motor 或結束 HOME/INIT。 */
+/** @brief 完成單顆 homing 後，立即處理該顆 offset。 */
 static void MotorCAN_CompleteCurrentHomeTarget(void) {
   if (motor_context.operation == MOTOR_CAN_OPERATION_INIT) {
-    const uint8_t next_target = (uint8_t)(motor_context.init_target_index + 1U);
-    if (next_target < MOTOR_CAN_INIT_TARGET_COUNT) {
-      motor_context.init_phase = MOTOR_INIT_PHASE_CONFIG_SMALL;
-      MotorCAN_BeginInitTarget(next_target);
-    } else {
-      MotorCAN_BeginInitPostOffset(MOTOR_CAN_INIT_BIG_COUNT,
-                                   MOTOR_CAN_INIT_SMALL_COUNT,
+    if (motor_context.init_phase == MOTOR_INIT_PHASE_HOME_SMALL) {
+      MotorCAN_BeginInitPostOffset(motor_context.init_target_index, 1U,
                                    MOTOR_INIT_PHASE_POST_OFFSET_SMALL);
+    } else if (motor_context.init_phase == MOTOR_INIT_PHASE_HOME_BIG) {
+      MotorCAN_BeginInitPostOffset(motor_context.init_target_index, 1U,
+                                   MOTOR_INIT_PHASE_POST_OFFSET_BIG);
+    } else if (motor_context.init_phase == MOTOR_INIT_PHASE_RESET_SMALL) {
+      MotorCAN_BeginInitPostOffset(motor_context.init_target_index, 1U,
+                                   MOTOR_INIT_PHASE_POST_RESET_SMALL);
+    } else {
+      MotorCAN_FailOperation(MOTOR_CAN_ERROR_DEVICE_REJECTED, 1U);
     }
   } else if (motor_context.rotate_plan.stage_count > 0U) {
     motor_context.rotate_stage_index = 0U;
@@ -1486,11 +1681,12 @@ static void MotorCAN_SwitchProvisionTo1MAndWaitForRestart(void) {
  * @brief 非阻塞地排入 ROTATE plan，並以 4AH/4BH Synchronization mark 啟動。
  * @param now 目前 HAL tick。
  * @retval 無。
- * @note 每輪最多送一筆 frame，避免多馬達 plan 塞滿 FDCAN TX FIFO。
+ * @note 每輪最多送一筆 frame；跨 bus stage 會依序處理各 bus 的同步命令。
  */
 static void MotorCAN_ProcessRotateQueue(uint32_t now) {
   const MachineMotionStage *stage;
   const MachineMotorMotion *motion;
+  uint8_t next_bus;
 
   if ((motor_context.operation != MOTOR_CAN_OPERATION_ROTATE) &&
       (motor_context.operation != MOTOR_CAN_OPERATION_HOME) &&
@@ -1515,14 +1711,20 @@ static void MotorCAN_ProcessRotateQueue(uint32_t now) {
 
   switch (motor_context.state) {
   case MOTOR_STATE_ROTATE_QUEUE_SYNC_ENABLE:
-    if (!MotorCAN_TxFifoHasSpace(motor_context.bus)) {
+    next_bus = MotorCAN_RotateNextUsedBus(motor_context.rotate_sync_bus);
+    if (next_bus == 0U) {
+      motor_context.rotate_sync_bus = 0U;
+      motor_context.state = MOTOR_STATE_ROTATE_QUEUE_MOTIONS;
+      break;
+    }
+    if (!MotorCAN_TxFifoHasSpace(next_bus)) {
       return;
     }
-    if (!MotorCAN_SendSynchronizationEnable(motor_context.bus, 1U)) {
+    if (!MotorCAN_SendSynchronizationEnable(next_bus, 1U)) {
       MotorCAN_FailOperation(MOTOR_CAN_ERROR_TX, 1U);
       return;
     }
-    motor_context.state = MOTOR_STATE_ROTATE_QUEUE_MOTIONS;
+    motor_context.rotate_sync_bus = next_bus;
     motor_context.rotate_queue_deadline =
         now + MOTOR_CAN_ROTATE_QUEUE_TIMEOUT_MS;
     break;
@@ -1532,10 +1734,10 @@ static void MotorCAN_ProcessRotateQueue(uint32_t now) {
       motor_context.state = MOTOR_STATE_ROTATE_QUEUE_SYNC_TRIGGER;
       break;
     }
-    if (!MotorCAN_TxFifoHasSpace(motor_context.bus)) {
+    motion = &stage->motions[motor_context.rotate_next_motion];
+    if (!MotorCAN_TxFifoHasSpace(motion->bus)) {
       return;
     }
-    motion = &stage->motions[motor_context.rotate_next_motion];
     if (!MotorCAN_SendAngleRotate(motion)) {
       MotorCAN_FailOperation(MOTOR_CAN_ERROR_TX, 1U);
       return;
@@ -1544,56 +1746,66 @@ static void MotorCAN_ProcessRotateQueue(uint32_t now) {
     motor_context.rotate_queue_deadline =
         now + MOTOR_CAN_ROTATE_QUEUE_TIMEOUT_MS;
     if (motor_context.rotate_next_motion >= stage->motion_count) {
+      motor_context.rotate_sync_bus = 0U;
+      motor_context.rotate_sync_trigger_count = 0U;
       motor_context.state = MOTOR_STATE_ROTATE_QUEUE_SYNC_TRIGGER;
     }
     break;
 
   case MOTOR_STATE_ROTATE_QUEUE_SYNC_TRIGGER:
-    if (!MotorCAN_TxFifoHasSpace(motor_context.bus)) {
-      return;
-    }
-    if (!MotorCAN_SendSynchronizationTrigger(motor_context.bus)) {
-      MotorCAN_FailOperation(MOTOR_CAN_ERROR_TX, 1U);
-      return;
-    }
-    motor_context.rotate_sync_trigger_count = 1U;
-    motor_context.state = MOTOR_STATE_ROTATE_REPEAT_SYNC_TRIGGER;
-    motor_context.deadline = now + MOTOR_CAN_SYNC_REPEAT_INTERVAL_MS;
-    motor_context.rotate_queue_deadline =
-        now + MOTOR_CAN_ROTATE_QUEUE_TIMEOUT_MS;
-    break;
-
   case MOTOR_STATE_ROTATE_REPEAT_SYNC_TRIGGER:
-    if (!MotorCAN_DeadlineReached(now, motor_context.deadline) ||
-        (!MotorCAN_TxFifoHasSpace(motor_context.bus))) {
+    if ((motor_context.state == MOTOR_STATE_ROTATE_REPEAT_SYNC_TRIGGER) &&
+        (motor_context.rotate_sync_bus == 0U) &&
+        (!MotorCAN_DeadlineReached(now, motor_context.deadline))) {
       return;
     }
-    if (!MotorCAN_SendSynchronizationTrigger(motor_context.bus)) {
-      MotorCAN_FailOperation(MOTOR_CAN_ERROR_TX, 1U);
-      return;
+    next_bus = MotorCAN_RotateNextUsedBus(motor_context.rotate_sync_bus);
+    if (next_bus != 0U) {
+      if (!MotorCAN_TxFifoHasSpace(next_bus)) {
+        return;
+      }
+      if (!MotorCAN_SendSynchronizationTrigger(next_bus)) {
+        MotorCAN_FailOperation(MOTOR_CAN_ERROR_TX, 1U);
+        return;
+      }
+      motor_context.rotate_sync_bus = next_bus;
+      motor_context.rotate_queue_deadline =
+          now + MOTOR_CAN_ROTATE_QUEUE_TIMEOUT_MS;
+      break;
     }
+
     motor_context.rotate_sync_trigger_count++;
-    motor_context.rotate_queue_deadline =
-        now + MOTOR_CAN_ROTATE_QUEUE_TIMEOUT_MS;
-    if (motor_context.rotate_sync_trigger_count >=
+    motor_context.rotate_sync_bus = 0U;
+    if (motor_context.rotate_sync_trigger_count <
         MOTOR_CAN_SYNC_TRIGGER_COUNT) {
-      motor_context.state = MOTOR_STATE_ROTATE_DISABLE_SYNC;
-    } else {
+      motor_context.state = MOTOR_STATE_ROTATE_REPEAT_SYNC_TRIGGER;
       motor_context.deadline = now + MOTOR_CAN_SYNC_REPEAT_INTERVAL_MS;
+    } else {
+      motor_context.state = MOTOR_STATE_ROTATE_DISABLE_SYNC;
     }
     break;
 
   case MOTOR_STATE_ROTATE_DISABLE_SYNC:
-    if (!MotorCAN_TxFifoHasSpace(motor_context.bus)) {
-      return;
+    next_bus = MotorCAN_RotateNextUsedBus(motor_context.rotate_sync_bus);
+    if (next_bus != 0U) {
+      if (!MotorCAN_TxFifoHasSpace(next_bus)) {
+        return;
+      }
+      if (!MotorCAN_SendSynchronizationEnable(next_bus, 0U)) {
+        MotorCAN_FailOperation(MOTOR_CAN_ERROR_TX, 1U);
+        return;
+      }
+      motor_context.rotate_sync_bus = next_bus;
+      motor_context.rotate_queue_deadline =
+          now + MOTOR_CAN_ROTATE_QUEUE_TIMEOUT_MS;
+      break;
     }
-    if (!MotorCAN_SendSynchronizationEnable(motor_context.bus, 0U)) {
-      MotorCAN_FailOperation(MOTOR_CAN_ERROR_TX, 1U);
-      return;
-    }
+
     motor_context.state = MOTOR_STATE_ROTATE_WAIT_RUN;
-    motor_context.deadline = now + motor_context.rotate_max_motion_ms +
-                             MOTOR_CAN_ROTATE_TIMEOUT_GUARD_MS;
+    motor_context.deadline = now + motor_context.rotate_max_motion_ms;
+    motor_context.rotate_poll_index = 0U;
+    motor_context.rotate_status_poll_deadline =
+        now + MOTOR_CAN_ROTATE_STATUS_POLL_INITIAL_DELAY_MS;
     if (motor_context.rotate_completed_mask ==
         (uint16_t)((1UL << stage->motion_count) - 1UL)) {
       MotorCAN_CompleteRotateStage();
@@ -1606,29 +1818,134 @@ static void MotorCAN_ProcessRotateQueue(uint32_t now) {
 }
 
 /**
- * @brief 非阻塞排入六顆 big motor 的 0x91，並在每條 bus 用 4AH/4BH 同步啟動。
- * @note 每輪最多傳一筆 frame；完成回覆可在排程期間先被記錄。
+ * @brief 讓目前 big homing 與同 Face 的 small follower 以 4AH/4BH 同步啟動。
+ * @note 每輪最多傳一筆 frame；big 完成後先停止 small，再推進下一顆。
  */
+static uint8_t MotorCAN_HomeSwitchIsActive(uint8_t io_status) {
+  return ((io_status & MOTOR_CAN_HOME_SWITCH_IN1_MASK) ==
+          MOTOR_CAN_HOME_SWITCH_ACTIVE_LEVEL)
+             ? 1U
+             : 0U;
+}
+
+static uint8_t MotorCAN_InitHomeMotionDirection(void) {
+  return (motor_context.init_home_phase == MOTOR_INIT_HOME_PHASE_RELEASE_SLOW)
+             ? (uint8_t)(motor_context.home_direction ^ 1U)
+             : motor_context.home_direction;
+}
+
+static uint16_t MotorCAN_InitHomeMotionSpeed(void) {
+  if (motor_context.init_home_phase == MOTOR_INIT_HOME_PHASE_SEARCH_FAST) {
+    return MOTOR_CAN_INIT_HIGH_SPEED_RPM;
+  }
+  if (motor_context.init_home_phase == MOTOR_INIT_HOME_PHASE_STOP) {
+    return 0U;
+  }
+  return MOTOR_CAN_INIT_LOW_SPEED_RPM;
+}
+
+static uint16_t MotorCAN_InitFollowerMotionSpeed(void) {
+  if (motor_context.init_home_phase == MOTOR_INIT_HOME_PHASE_SEARCH_FAST) {
+    return MOTOR_CAN_INIT_FOLLOWER_SPEED_RPM;
+  }
+  if (motor_context.init_home_phase == MOTOR_INIT_HOME_PHASE_STOP) {
+    return 0U;
+  }
+  return MOTOR_CAN_INIT_FOLLOWER_OFFSET_SPEED_RPM;
+}
+
+static void MotorCAN_BeginInitHomeMotionPhase(MotorCAN_InitHomePhase phase,
+                                              uint32_t now) {
+  motor_context.init_home_phase = phase;
+  motor_context.init_sync_bus = 0U;
+  motor_context.init_sync_trigger_count = 0U;
+  motor_context.init_queue_step = 0U;
+  motor_context.init_home_switch_stable_count = 0U;
+  motor_context.init_stopped_pair_mask = 0U;
+  motor_context.state = MOTOR_STATE_INIT_BIG_SYNC_ENABLE;
+  motor_context.init_queue_deadline = now + MOTOR_CAN_INIT_QUEUE_TIMEOUT_MS;
+  motor_context.deadline = motor_context.init_home_deadline;
+}
+
 static void MotorCAN_ProcessInitQueue(uint32_t now) {
+  const MotorCAN_InitTarget *target;
+  const MotorCAN_InitTarget *follower = NULL;
+  uint8_t uses_follower;
   uint8_t next_bus;
 
   if ((motor_context.operation != MOTOR_CAN_OPERATION_INIT) ||
-      (motor_context.init_phase != MOTOR_INIT_PHASE_HOME_BIG)) {
+      (!MotorCAN_IsInitHomeState())) {
+    return;
+  }
+  if (motor_context.init_target_index >= MOTOR_CAN_INIT_TARGET_COUNT) {
+    MotorCAN_FailOperation(MOTOR_CAN_ERROR_DEVICE_REJECTED, 1U);
+    return;
+  }
+  uses_follower =
+      motor_context.init_phase == MOTOR_INIT_PHASE_HOME_BIG ? 1U : 0U;
+  if ((!uses_follower) &&
+      (motor_context.init_phase != MOTOR_INIT_PHASE_HOME_SMALL) &&
+      (motor_context.init_phase != MOTOR_INIT_PHASE_RESET_SMALL)) {
+    MotorCAN_FailOperation(MOTOR_CAN_ERROR_DEVICE_REJECTED, 1U);
+    return;
+  }
+  target = &motor_context.init_targets[motor_context.init_target_index];
+  if (uses_follower) {
+    if (motor_context.init_target_index >= MOTOR_CAN_INIT_BIG_COUNT) {
+      MotorCAN_FailOperation(MOTOR_CAN_ERROR_DEVICE_REJECTED, 1U);
+      return;
+    }
+    follower = &motor_context.init_targets[MOTOR_CAN_INIT_BIG_COUNT +
+                                           motor_context.init_target_index];
+    if (follower->bus != target->bus) {
+      MotorCAN_FailOperation(MOTOR_CAN_ERROR_DEVICE_REJECTED, 1U);
+      return;
+    }
+  } else if (motor_context.init_target_index < MOTOR_CAN_INIT_BIG_COUNT) {
+    MotorCAN_FailOperation(MOTOR_CAN_ERROR_DEVICE_REJECTED, 1U);
     return;
   }
 
-  if ((motor_context.state != MOTOR_STATE_INIT_BIG_WAIT_HOME) &&
+  if ((motor_context.state != MOTOR_STATE_INIT_BIG_WAIT_SET_ZERO) &&
+      MotorCAN_DeadlineReached(now, motor_context.init_home_deadline)) {
+    MotorCAN_FailOperation(MOTOR_CAN_ERROR_HOME_TIMEOUT, 1U);
+    return;
+  }
+  if (((motor_context.state == MOTOR_STATE_INIT_BIG_WAIT_SWITCH) ||
+       (motor_context.state == MOTOR_STATE_INIT_BIG_WAIT_STOP)) &&
+      MotorCAN_DeadlineReached(now, motor_context.init_queue_deadline)) {
+    MotorCAN_FailOperation(MOTOR_CAN_ERROR_RESPONSE_TIMEOUT, 1U);
+    return;
+  }
+  if ((motor_context.state != MOTOR_STATE_INIT_BIG_WAIT_SWITCH) &&
+      (motor_context.state != MOTOR_STATE_INIT_BIG_WAIT_STOP) &&
+      (motor_context.state != MOTOR_STATE_INIT_BIG_WAIT_SET_ZERO) &&
       MotorCAN_DeadlineReached(now, motor_context.init_queue_deadline)) {
     MotorCAN_FailOperation(MOTOR_CAN_ERROR_TX, 1U);
     return;
   }
 
   switch (motor_context.state) {
+  case MOTOR_STATE_INIT_BIG_WAIT_SWITCH:
+    if (!MotorCAN_DeadlineReached(now,
+                                  motor_context.home_status_poll_deadline)) {
+      break;
+    }
+    if (!MotorCAN_TxFifoHasSpace(target->bus)) {
+      return;
+    }
+    if (!MotorCAN_SendReadIoStatus(target->bus, target->id)) {
+      MotorCAN_FailOperation(MOTOR_CAN_ERROR_TX, 1U);
+      return;
+    }
+    motor_context.home_status_poll_deadline = motor_context.init_queue_deadline;
+    break;
+
   case MOTOR_STATE_INIT_BIG_SYNC_ENABLE:
     next_bus = MotorCAN_InitNextUsedBus(motor_context.init_sync_bus);
     if (next_bus == 0U) {
-      motor_context.init_target_index = 0U;
-      motor_context.state = MOTOR_STATE_INIT_BIG_QUEUE_HOME;
+      motor_context.init_queue_step = 0U;
+      motor_context.state = MOTOR_STATE_INIT_BIG_QUEUE_SPEED;
       break;
     }
     if (!MotorCAN_TxFifoHasSpace(next_bus)) {
@@ -1642,25 +1959,36 @@ static void MotorCAN_ProcessInitQueue(uint32_t now) {
     motor_context.init_queue_deadline = now + MOTOR_CAN_INIT_QUEUE_TIMEOUT_MS;
     break;
 
-  case MOTOR_STATE_INIT_BIG_QUEUE_HOME:
-    if (motor_context.init_target_index >= MOTOR_CAN_INIT_BIG_COUNT) {
-      motor_context.init_sync_bus = 0U;
-      motor_context.init_sync_trigger_count = 0U;
-      motor_context.state = MOTOR_STATE_INIT_BIG_SYNC_TRIGGER;
-      break;
-    }
-    {
-      const MotorCAN_InitTarget *target =
-          &motor_context.init_targets[motor_context.init_target_index];
-      if (!MotorCAN_TxFifoHasSpace(target->bus)) {
+  case MOTOR_STATE_INIT_BIG_QUEUE_SPEED:
+    if (uses_follower && (motor_context.init_queue_step == 0U)) {
+      if (!MotorCAN_TxFifoHasSpace(follower->bus)) {
         return;
       }
-      if (!MotorCAN_SendExecuteHome(target->bus, target->id)) {
+      if (!MotorCAN_SendContinuousSpeed(
+              follower->bus, follower->id,
+              MotorCAN_InitHomeMotionDirection(),
+              MotorCAN_InitFollowerMotionSpeed(),
+              MOTOR_CAN_INIT_FOLLOWER_ACCELERATION)) {
         MotorCAN_FailOperation(MOTOR_CAN_ERROR_TX, 1U);
         return;
       }
+      motor_context.init_queue_step = 1U;
+      motor_context.init_queue_deadline = now + MOTOR_CAN_INIT_QUEUE_TIMEOUT_MS;
+      return;
     }
-    motor_context.init_target_index++;
+    if (!MotorCAN_TxFifoHasSpace(target->bus)) {
+      return;
+    }
+    if (!MotorCAN_SendContinuousSpeed(target->bus, target->id,
+                                      MotorCAN_InitHomeMotionDirection(),
+                                      MotorCAN_InitHomeMotionSpeed(),
+                                      MOTOR_CAN_INIT_TARGET_ACCELERATION)) {
+      MotorCAN_FailOperation(MOTOR_CAN_ERROR_TX, 1U);
+      return;
+    }
+    motor_context.init_sync_bus = 0U;
+    motor_context.init_sync_trigger_count = 0U;
+    motor_context.state = MOTOR_STATE_INIT_BIG_SYNC_TRIGGER;
     motor_context.init_queue_deadline = now + MOTOR_CAN_INIT_QUEUE_TIMEOUT_MS;
     break;
 
@@ -1710,58 +2038,71 @@ static void MotorCAN_ProcessInitQueue(uint32_t now) {
       break;
     }
 
-    motor_context.state = MOTOR_STATE_INIT_BIG_WAIT_HOME;
-    motor_context.deadline =
-        now + motor_context.home_timeout_ms + MOTOR_CAN_HOME_TIMEOUT_GUARD_MS;
-    motor_context.home_status_poll_deadline =
-        now + MOTOR_CAN_HOME_STATUS_POLL_INTERVAL_MS;
+    motor_context.deadline = motor_context.init_home_deadline;
     motor_context.init_poll_index = 0U;
-    if (motor_context.init_completed_mask ==
-        (uint16_t)((1UL << MOTOR_CAN_INIT_BIG_COUNT) - 1UL)) {
-      MotorCAN_BeginInitPostOffset(0U, MOTOR_CAN_INIT_BIG_COUNT,
-                                   MOTOR_INIT_PHASE_POST_OFFSET_BIG);
+    motor_context.home_status_poll_deadline = now;
+    motor_context.init_queue_deadline =
+        now + MOTOR_CAN_INIT_IO_RESPONSE_TIMEOUT_MS;
+    if (motor_context.init_home_phase == MOTOR_INIT_HOME_PHASE_STOP) {
+      motor_context.init_stopped_pair_mask = 0U;
+      motor_context.state = MOTOR_STATE_INIT_BIG_WAIT_STOP;
+    } else {
+      motor_context.init_home_switch_stable_count = 0U;
+      motor_context.state = MOTOR_STATE_INIT_BIG_WAIT_SWITCH;
     }
     break;
 
-  case MOTOR_STATE_INIT_BIG_WAIT_HOME: {
+  case MOTOR_STATE_INIT_BIG_WAIT_STOP: {
+    const uint8_t poll_count = uses_follower ? 2U : 1U;
     uint8_t attempt;
 
     if (!MotorCAN_DeadlineReached(now,
                                   motor_context.home_status_poll_deadline)) {
       break;
     }
-    for (attempt = 0U; attempt < MOTOR_CAN_INIT_BIG_COUNT; attempt++) {
+    for (attempt = 0U; attempt < poll_count; attempt++) {
       const uint8_t index =
-          (uint8_t)((motor_context.init_poll_index + attempt) %
-                    MOTOR_CAN_INIT_BIG_COUNT);
-      const uint16_t completed_bit = (uint16_t)(1UL << index);
-      const MotorCAN_InitTarget *target = &motor_context.init_targets[index];
+          (uint8_t)((motor_context.init_poll_index + attempt) % poll_count);
+      const uint8_t stopped_bit = (index == 0U)
+                                      ? MOTOR_CAN_INIT_STOPPED_BIG_MASK
+                                      : MOTOR_CAN_INIT_STOPPED_FOLLOWER_MASK;
+      const MotorCAN_InitTarget *poll_target =
+          (index == 0U) ? target : follower;
 
-      if ((motor_context.init_completed_mask & completed_bit) != 0U) {
+      if ((motor_context.init_stopped_pair_mask & stopped_bit) != 0U) {
         continue;
       }
-      if (!MotorCAN_TxFifoHasSpace(target->bus)) {
+      if (!MotorCAN_TxFifoHasSpace(poll_target->bus)) {
         return;
       }
-      if (!MotorCAN_SendReadHomeStatus(target->bus, target->id)) {
+      if (!MotorCAN_SendReadMotorStatus(poll_target->bus, poll_target->id)) {
         MotorCAN_FailOperation(MOTOR_CAN_ERROR_TX, 1U);
         return;
       }
-      motor_context.init_poll_index =
-          (uint8_t)((index + 1U) % MOTOR_CAN_INIT_BIG_COUNT);
+      motor_context.init_poll_index = (uint8_t)((index + 1U) % poll_count);
       motor_context.home_status_poll_deadline =
-          now + MOTOR_CAN_HOME_STATUS_POLL_INTERVAL_MS;
-      break;
+          motor_context.init_queue_deadline;
+      return;
     }
     break;
   }
 
+  case MOTOR_STATE_INIT_BIG_SET_ZERO:
+    if (!MotorCAN_TxFifoHasSpace(target->bus)) {
+      return;
+    }
+    MotorCAN_SendOrFail(
+        MotorCAN_SendSetCurrentPositionZero(target->bus, target->id),
+        MOTOR_STATE_INIT_BIG_WAIT_SET_ZERO, MOTOR_CAN_COMMAND_TIMEOUT_MS);
+    break;
+
+  case MOTOR_STATE_INIT_BIG_WAIT_SET_ZERO:
   default:
     break;
   }
 }
 
-/** @brief HOME 與逐顆 small motor homing 期間，以 0x3B 輪詢實際完成狀態。 */
+/** @brief HOME 與 INIT 逐顆 homing 期間，以 0x3B 輪詢實際完成狀態。 */
 static void MotorCAN_ProcessHomeStatusPolling(uint32_t now) {
   if ((motor_context.state != MOTOR_STATE_HOME_WAIT_EXECUTE) ||
       ((motor_context.operation != MOTOR_CAN_OPERATION_HOME) &&
@@ -1779,6 +2120,43 @@ static void MotorCAN_ProcessHomeStatusPolling(uint32_t now) {
   }
   motor_context.home_status_poll_deadline =
       now + MOTOR_CAN_HOME_STATUS_POLL_INTERVAL_MS;
+}
+
+/** @brief ROTATE 執行期間輪詢各馬達 F1，全部回報停止後立即完成 stage。 */
+static void MotorCAN_ProcessRotateStatusPolling(uint32_t now) {
+  const MachineMotionStage *stage;
+  uint8_t attempt;
+
+  if ((motor_context.state != MOTOR_STATE_ROTATE_WAIT_RUN) ||
+      !MotorCAN_DeadlineReached(now,
+                                motor_context.rotate_status_poll_deadline)) {
+    return;
+  }
+
+  stage = &motor_context.rotate_plan.stages[motor_context.rotate_stage_index];
+  for (attempt = 0U; attempt < stage->motion_count; attempt++) {
+    const uint8_t index =
+        (uint8_t)((motor_context.rotate_poll_index + attempt) %
+                  stage->motion_count);
+    const uint16_t completed_bit = (uint16_t)(1UL << index);
+    const MachineMotorMotion *motion = &stage->motions[index];
+
+    if ((motor_context.rotate_completed_mask & completed_bit) != 0U) {
+      continue;
+    }
+    if (!MotorCAN_TxFifoHasSpace(motion->bus)) {
+      return;
+    }
+    if (!MotorCAN_SendReadMotorStatus(motion->bus, motion->id)) {
+      MotorCAN_FailOperation(MOTOR_CAN_ERROR_TX, 1U);
+      return;
+    }
+    motor_context.rotate_poll_index =
+        (uint8_t)((index + 1U) % stage->motion_count);
+    motor_context.rotate_status_poll_deadline =
+        now + MOTOR_CAN_ROTATE_STATUS_POLL_INTERVAL_MS;
+    return;
+  }
 }
 
 /**
@@ -1810,7 +2188,9 @@ static void MotorCAN_HandleFrame(const MotorCAN_RxFrame *frame) {
   }
   if ((frame->bus != motor_context.bus) &&
       !((motor_context.operation == MOTOR_CAN_OPERATION_INIT) &&
-        (motor_context.init_phase == MOTOR_INIT_PHASE_HOME_BIG))) {
+        (motor_context.init_phase == MOTOR_INIT_PHASE_HOME_BIG) &&
+        MotorCAN_IsInitHomeState()) &&
+      (!MotorCAN_RotateStageUsesBus(frame->bus))) {
     return;
   }
 
@@ -2141,18 +2521,17 @@ static void MotorCAN_HandleFrame(const MotorCAN_RxFrame *frame) {
         MotorCAN_FailOperation(MOTOR_CAN_ERROR_DEVICE_REJECTED, 1U);
         break;
       }
-      if ((motor_context.operation == MOTOR_CAN_OPERATION_INIT) &&
-          (motor_context.init_phase == MOTOR_INIT_PHASE_CONFIG_BIG)) {
-        uint8_t next_target = (uint8_t)(motor_context.init_target_index + 1U);
-        if (next_target < MOTOR_CAN_INIT_BIG_COUNT) {
-          MotorCAN_BeginInitTarget(next_target);
+      if (motor_context.operation == MOTOR_CAN_OPERATION_INIT) {
+        if (motor_context.init_phase == MOTOR_INIT_PHASE_CONFIG_SMALL) {
+          MotorCAN_BeginInitHomeTarget(motor_context.init_target_index,
+                                       MOTOR_INIT_PHASE_HOME_SMALL);
+        } else if (motor_context.init_phase == MOTOR_INIT_PHASE_CONFIG_BIG) {
+          MotorCAN_BeginInitHomeTarget(motor_context.init_target_index,
+                                       MOTOR_INIT_PHASE_HOME_BIG);
         } else {
-          MotorCAN_BeginInitBigHoming(HAL_GetTick());
+          MotorCAN_FailOperation(MOTOR_CAN_ERROR_DEVICE_REJECTED, 1U);
         }
         break;
-      }
-      if (motor_context.operation == MOTOR_CAN_OPERATION_INIT) {
-        motor_context.init_phase = MOTOR_INIT_PHASE_HOME_SMALL;
       }
       {
         const uint32_t now = HAL_GetTick();
@@ -2196,65 +2575,165 @@ static void MotorCAN_HandleFrame(const MotorCAN_RxFrame *frame) {
     }
     break;
 
-  /* big motor 的 0x91 回覆可能在 4BH 排程中或進入等待後抵達。 */
-  case MOTOR_STATE_INIT_BIG_QUEUE_HOME:
-  case MOTOR_STATE_INIT_BIG_SYNC_TRIGGER:
-  case MOTOR_STATE_INIT_BIG_REPEAT_SYNC_TRIGGER:
-  case MOTOR_STATE_INIT_BIG_DISABLE_SYNC:
-  case MOTOR_STATE_INIT_BIG_WAIT_HOME:
-    if (((frame->data[0] == 0x91U) && (frame->length >= 3U)) ||
-        ((frame->data[0] == 0x3BU) && (frame->length >= 4U))) {
-      uint8_t index;
-      uint8_t matched = 0U;
+  /* INIT homing 由 STM32 讀 IN_1，依開關邊緣切換同步速度階段。 */
+  case MOTOR_STATE_INIT_BIG_WAIT_SWITCH:
+    if ((frame->data[0] == 0x34U) && (frame->length >= 3U)) {
+      const MotorCAN_InitTarget *target =
+          &motor_context.init_targets[motor_context.init_target_index];
+      const uint8_t switch_active = MotorCAN_HomeSwitchIsActive(frame->data[1]);
+      const uint32_t now = HAL_GetTick();
+      uint8_t expected_active;
 
-      for (index = 0U; index < MOTOR_CAN_INIT_BIG_COUNT; index++) {
-        if ((frame->bus == motor_context.init_targets[index].bus) &&
-            (frame->id == motor_context.init_targets[index].id)) {
-          matched = 1U;
-          break;
-        }
+      if ((frame->bus != target->bus) || (frame->id != target->id)) {
+        break;
       }
-      if (!matched) {
+      if (motor_context.init_home_phase ==
+          MOTOR_INIT_HOME_PHASE_CHECK_INITIAL_SWITCH) {
+        MotorCAN_BeginInitHomeMotionPhase(
+            switch_active ? MOTOR_INIT_HOME_PHASE_RELEASE_SLOW
+                          : MOTOR_INIT_HOME_PHASE_SEARCH_FAST,
+            now);
         break;
       }
 
-      if (frame->data[0] == 0x3BU) {
-        if (frame->data[2] == 1U) {
-          MotorCAN_MarkInitBigComplete(index, frame);
-        } else if (frame->data[2] == 2U) {
-          motor_context.bus = frame->bus;
-          motor_context.id = frame->id;
-          MotorCAN_FailOperation(MOTOR_CAN_ERROR_HOME_TIMEOUT, 1U);
-        } else if (frame->data[2] != 0U) {
-          motor_context.bus = frame->bus;
-          motor_context.id = frame->id;
+      expected_active =
+          (motor_context.init_home_phase == MOTOR_INIT_HOME_PHASE_RELEASE_SLOW)
+              ? 0U
+              : 1U;
+      if (switch_active == expected_active) {
+        if (motor_context.init_home_switch_stable_count <
+            MOTOR_CAN_INIT_SWITCH_STABLE_SAMPLES) {
+          motor_context.init_home_switch_stable_count++;
+        }
+      } else {
+        motor_context.init_home_switch_stable_count = 0U;
+      }
+
+      if (motor_context.init_home_switch_stable_count >=
+          MOTOR_CAN_INIT_SWITCH_STABLE_SAMPLES) {
+        if (motor_context.init_home_phase ==
+            MOTOR_INIT_HOME_PHASE_SEARCH_FAST) {
+          MotorCAN_BeginInitHomeMotionPhase(MOTOR_INIT_HOME_PHASE_RELEASE_SLOW,
+                                            now);
+        } else if (motor_context.init_home_phase ==
+                   MOTOR_INIT_HOME_PHASE_RELEASE_SLOW) {
+          MotorCAN_BeginInitHomeMotionPhase(MOTOR_INIT_HOME_PHASE_LATCH_SLOW,
+                                            now);
+        } else if (motor_context.init_home_phase ==
+                   MOTOR_INIT_HOME_PHASE_LATCH_SLOW) {
+          MotorCAN_BeginInitHomeMotionPhase(MOTOR_INIT_HOME_PHASE_STOP, now);
+        } else {
           MotorCAN_FailOperation(MOTOR_CAN_ERROR_DEVICE_REJECTED, 1U);
         }
-      } else if (frame->data[1] == 2U) {
-        MotorCAN_MarkInitBigComplete(index, frame);
-      } else if (frame->data[1] == 1U) {
-        if (motor_context.state == MOTOR_STATE_INIT_BIG_WAIT_HOME) {
-          motor_context.deadline = HAL_GetTick() +
-                                   motor_context.home_timeout_ms +
-                                   MOTOR_CAN_HOME_TIMEOUT_GUARD_MS;
-        }
-      } else if (frame->data[1] == 3U) {
+      } else {
+        motor_context.home_status_poll_deadline =
+            now + MOTOR_CAN_INIT_IO_POLL_INTERVAL_MS;
+        motor_context.init_queue_deadline =
+            now + MOTOR_CAN_INIT_IO_RESPONSE_TIMEOUT_MS;
+      }
+    }
+    break;
+
+  case MOTOR_STATE_INIT_BIG_QUEUE_SPEED:
+  case MOTOR_STATE_INIT_BIG_SYNC_TRIGGER:
+  case MOTOR_STATE_INIT_BIG_REPEAT_SYNC_TRIGGER:
+  case MOTOR_STATE_INIT_BIG_DISABLE_SYNC:
+    if ((frame->data[0] == 0xF6U) && (frame->length >= 3U) &&
+        (frame->data[1] == 0U)) {
+      const MotorCAN_InitTarget *target =
+          &motor_context.init_targets[motor_context.init_target_index];
+      const uint8_t uses_follower =
+          motor_context.init_phase == MOTOR_INIT_PHASE_HOME_BIG ? 1U : 0U;
+      const MotorCAN_InitTarget *follower =
+          uses_follower
+              ? &motor_context.init_targets[MOTOR_CAN_INIT_BIG_COUNT +
+                                            motor_context.init_target_index]
+              : NULL;
+
+      if (((frame->bus == target->bus) && (frame->id == target->id)) ||
+          (uses_follower && (frame->bus == follower->bus) &&
+           (frame->id == follower->id))) {
         motor_context.bus = frame->bus;
         motor_context.id = frame->id;
-        MotorCAN_FailOperation(MOTOR_CAN_ERROR_HOME_TIMEOUT, 1U);
-      } else if (frame->data[1] != 5U) {
         MotorCAN_FailOperation(MOTOR_CAN_ERROR_DEVICE_REJECTED, 1U);
       }
     }
     break;
 
-  /* ROTATE 排程中也可能收到 status=5/0；完成狀態則在同步觸發後統計。 */
+  case MOTOR_STATE_INIT_BIG_WAIT_STOP:
+    if ((frame->data[0] == 0xF1U) && (frame->length >= 3U)) {
+      const MotorCAN_InitTarget *target =
+          &motor_context.init_targets[motor_context.init_target_index];
+      const uint8_t uses_follower =
+          motor_context.init_phase == MOTOR_INIT_PHASE_HOME_BIG ? 1U : 0U;
+      const uint8_t expected_stopped_mask =
+          uses_follower ? MOTOR_CAN_INIT_STOPPED_PAIR_MASK
+                        : MOTOR_CAN_INIT_STOPPED_BIG_MASK;
+      const MotorCAN_InitTarget *follower =
+          uses_follower
+              ? &motor_context.init_targets[MOTOR_CAN_INIT_BIG_COUNT +
+                                            motor_context.init_target_index]
+              : NULL;
+      const uint32_t now = HAL_GetTick();
+      uint8_t stopped_bit = 0U;
+
+      if ((frame->bus == target->bus) && (frame->id == target->id)) {
+        stopped_bit = MOTOR_CAN_INIT_STOPPED_BIG_MASK;
+      } else if (uses_follower && (frame->bus == follower->bus) &&
+                 (frame->id == follower->id)) {
+        stopped_bit = MOTOR_CAN_INIT_STOPPED_FOLLOWER_MASK;
+      } else {
+        break;
+      }
+
+      if (frame->data[1] == 1U) {
+        motor_context.init_stopped_pair_mask |= stopped_bit;
+      } else if ((frame->data[1] < 2U) || (frame->data[1] > 5U)) {
+        motor_context.bus = frame->bus;
+        motor_context.id = frame->id;
+        MotorCAN_FailOperation(MOTOR_CAN_ERROR_DEVICE_REJECTED, 1U);
+        break;
+      }
+
+      if ((motor_context.init_stopped_pair_mask & expected_stopped_mask) ==
+          expected_stopped_mask) {
+        motor_context.state = MOTOR_STATE_INIT_BIG_SET_ZERO;
+        motor_context.init_queue_deadline =
+            now + MOTOR_CAN_INIT_QUEUE_TIMEOUT_MS;
+        motor_context.deadline = motor_context.init_home_deadline;
+      } else {
+        motor_context.home_status_poll_deadline =
+            now + MOTOR_CAN_INIT_STOP_POLL_INTERVAL_MS;
+        motor_context.init_queue_deadline =
+            now + MOTOR_CAN_INIT_IO_RESPONSE_TIMEOUT_MS;
+      }
+    }
+    break;
+
+  case MOTOR_STATE_INIT_BIG_WAIT_SET_ZERO:
+    if ((frame->data[0] == 0x92U) && (frame->length >= 3U)) {
+      const uint8_t index = motor_context.init_target_index;
+      const MotorCAN_InitTarget *target = &motor_context.init_targets[index];
+
+      if ((frame->bus != target->bus) || (frame->id != target->id)) {
+        break;
+      }
+      if (frame->data[1] != 1U) {
+        MotorCAN_FailOperation(MOTOR_CAN_ERROR_DEVICE_REJECTED, 1U);
+        break;
+      }
+      MotorCAN_CompleteCurrentHomeTarget();
+    }
+    break;
+
+  /* ROTATE 接受 F4 主動完成回覆，也用 F1 輪詢補足 CanRSP 關閉的馬達。 */
   case MOTOR_STATE_ROTATE_QUEUE_MOTIONS:
   case MOTOR_STATE_ROTATE_QUEUE_SYNC_TRIGGER:
   case MOTOR_STATE_ROTATE_REPEAT_SYNC_TRIGGER:
   case MOTOR_STATE_ROTATE_DISABLE_SYNC:
   case MOTOR_STATE_ROTATE_WAIT_RUN:
-    if ((frame->data[0] == 0xF4U) && (frame->length >= 3U)) {
+    if (((frame->data[0] == 0xF4U) || (frame->data[0] == 0xF1U)) &&
+        (frame->length >= 3U)) {
       const MachineMotionStage *stage =
           &motor_context.rotate_plan.stages[motor_context.rotate_stage_index];
       uint8_t index;
@@ -2271,6 +2750,23 @@ static void MotorCAN_HandleFrame(const MotorCAN_RxFrame *frame) {
         break;
       }
 
+      if (frame->data[0] == 0xF1U) {
+        if (motor_context.state != MOTOR_STATE_ROTATE_WAIT_RUN) {
+          break;
+        }
+        if (frame->data[1] == 1U) {
+          motor_context.rotate_completed_mask |= (uint16_t)(1UL << index);
+          if (motor_context.rotate_completed_mask ==
+              (uint16_t)((1UL << stage->motion_count) - 1UL)) {
+            MotorCAN_CompleteRotateStage();
+          }
+        } else if ((frame->data[1] >= 2U) && (frame->data[1] <= 4U)) {
+          /* 持續收到運轉狀態時，deadline 只作為回覆中斷的 watchdog。 */
+          motor_context.deadline = HAL_GetTick() + MOTOR_CAN_COMMAND_TIMEOUT_MS;
+        }
+        break;
+      }
+
       if (frame->data[1] == 2U) {
         motor_context.rotate_completed_mask |= (uint16_t)(1UL << index);
         if ((motor_context.state == MOTOR_STATE_ROTATE_WAIT_RUN) &&
@@ -2280,9 +2776,8 @@ static void MotorCAN_HandleFrame(const MotorCAN_RxFrame *frame) {
         }
       } else if (frame->data[1] == 1U) {
         if (motor_context.state == MOTOR_STATE_ROTATE_WAIT_RUN) {
-          motor_context.deadline = HAL_GetTick() +
-                                   motor_context.rotate_max_motion_ms +
-                                   MOTOR_CAN_ROTATE_TIMEOUT_GUARD_MS;
+          motor_context.deadline =
+              HAL_GetTick() + motor_context.rotate_max_motion_ms;
         }
       } else if (frame->data[1] != 5U) {
         MotorCAN_FailOperation(MOTOR_CAN_ERROR_DEVICE_REJECTED, 1U);
@@ -2423,17 +2918,19 @@ static void MotorCAN_HandleTimeout(uint32_t now) {
     MotorCAN_FailOperation(MOTOR_CAN_ERROR_HOME_TIMEOUT, 1U);
     break;
 
+  case MOTOR_STATE_INIT_BIG_WAIT_SWITCH:
   case MOTOR_STATE_INIT_BIG_SYNC_ENABLE:
-  case MOTOR_STATE_INIT_BIG_QUEUE_HOME:
+  case MOTOR_STATE_INIT_BIG_QUEUE_SPEED:
   case MOTOR_STATE_INIT_BIG_SYNC_TRIGGER:
   case MOTOR_STATE_INIT_BIG_REPEAT_SYNC_TRIGGER:
   case MOTOR_STATE_INIT_BIG_DISABLE_SYNC:
+  case MOTOR_STATE_INIT_BIG_WAIT_STOP:
+  case MOTOR_STATE_INIT_BIG_SET_ZERO:
     /* 非阻塞排程與 TX timeout 由 MotorCAN_ProcessInitQueue() 處理。 */
     break;
 
-  case MOTOR_STATE_INIT_BIG_WAIT_HOME:
-    MotorCAN_SelectFirstMissingInitBigTarget();
-    MotorCAN_FailOperation(MOTOR_CAN_ERROR_HOME_TIMEOUT, 1U);
+  case MOTOR_STATE_INIT_BIG_WAIT_SET_ZERO:
+    MotorCAN_FailOperation(MOTOR_CAN_ERROR_RESPONSE_TIMEOUT, 1U);
     break;
 
   case MOTOR_STATE_ROTATE_QUEUE_SYNC_ENABLE:
@@ -2445,7 +2942,7 @@ static void MotorCAN_HandleTimeout(uint32_t now) {
     break;
 
   case MOTOR_STATE_ROTATE_WAIT_RUN:
-    /* CanRSP 可關閉；目前 stage 經估算動作時間 + guard 後接著執行下一組。 */
+    /* CanRSP 可關閉；目前 stage 經估算動作時間後接著執行下一組。 */
     MotorCAN_CompleteRotateStage();
     break;
 
@@ -2674,13 +3171,19 @@ MotorCAN_Status MotorCAN_StartSetId(uint8_t bus, uint16_t old_id,
 }
 
 /**
- * @brief 同步 homing 六顆 big motor，完成後依序 homing 六顆 small motor。
+ * @brief STM32 依序 homing small，再依序 homing big，最後重新 homing small。
  * @return 立即啟動狀態；最終結果由 event queue 回報。
  * @note 馬達清單來自 MachineState，只有完整成功才會解除運動指令鎖定。
  */
-MotorCAN_Status
-MotorCAN_StartInitWithOffsetAngles(double big_offset_angle_degrees,
-                                   double small_offset_angle_degrees) {
+MotorCAN_Status MotorCAN_StartInitWithOffsetAngles(
+    double big_additional_offset_angle_degrees,
+    double small_additional_offset_angle_degrees) {
+  const double big_offset_angle_degrees =
+      MOTOR_CAN_INIT_BIG_MOTOR_OFFSET_ANGLE_DEGREES +
+      big_additional_offset_angle_degrees;
+  const double small_offset_angle_degrees =
+      MOTOR_CAN_INIT_SMALL_MOTOR_OFFSET_ANGLE_DEGREES +
+      small_additional_offset_angle_degrees;
   const MachineState *state;
   const FaceModule *modules[MOTOR_CAN_INIT_BIG_COUNT];
   uint8_t index;
@@ -2748,18 +3251,18 @@ MotorCAN_StartInitWithOffsetAngles(double big_offset_angle_degrees,
   }
 
   motor_context.operation = MOTOR_CAN_OPERATION_INIT;
-  motor_context.init_phase = MOTOR_INIT_PHASE_CONFIG_BIG;
+  motor_context.init_phase = MOTOR_INIT_PHASE_CONFIG_SMALL;
   motor_context.home_high_speed_rpm = MOTOR_CAN_INIT_HIGH_SPEED_RPM;
   motor_context.home_low_speed_rpm = MOTOR_CAN_INIT_LOW_SPEED_RPM;
   motor_context.home_offset_angle_degrees =
-      motor_context.init_targets[0].offset_angle_degrees;
-  motor_context.home_origin_offset_counts = MotorCAN_HomeOffsetAngleToCounts(
-      motor_context.home_offset_angle_degrees);
+      motor_context.init_targets[MOTOR_CAN_INIT_BIG_COUNT].offset_angle_degrees;
+  motor_context.home_origin_offset_counts = 0U;
   motor_context.home_timeout_ms = MOTOR_CAN_INIT_HOME_TIMEOUT_MS;
-  motor_context.init_target_index = 0U;
-  motor_context.bus = motor_context.init_targets[0].bus;
-  motor_context.id = motor_context.init_targets[0].id;
-  motor_context.home_direction = motor_context.init_targets[0].direction;
+  motor_context.init_target_index = MOTOR_CAN_INIT_BIG_COUNT;
+  motor_context.bus = motor_context.init_targets[MOTOR_CAN_INIT_BIG_COUNT].bus;
+  motor_context.id = motor_context.init_targets[MOTOR_CAN_INIT_BIG_COUNT].id;
+  motor_context.home_direction =
+      motor_context.init_targets[MOTOR_CAN_INIT_BIG_COUNT].direction;
   motor_can_initialized = 0U;
 
   if (!MotorCAN_SendReadVersion(motor_context.bus, motor_context.id)) {
@@ -2772,9 +3275,7 @@ MotorCAN_StartInitWithOffsetAngles(double big_offset_angle_degrees,
 }
 
 MotorCAN_Status MotorCAN_StartInit(void) {
-  return MotorCAN_StartInitWithOffsetAngles(
-      MOTOR_CAN_INIT_BIG_MOTOR_OFFSET_ANGLE_DEGREES,
-      MOTOR_CAN_INIT_SMALL_MOTOR_OFFSET_ANGLE_DEGREES);
+  return MotorCAN_StartInitWithOffsetAngles(0.0, 0.0);
 }
 
 uint8_t MotorCAN_IsInitialized(void) { return motor_can_initialized; }
@@ -2821,7 +3322,7 @@ MotorCAN_Status MotorCAN_StartTest(uint8_t bus, uint16_t id) {
  * @brief 由 machine_state 建立多馬達 plan，使用 4AH/4BH 同步執行 F4H 角度動作。
  * @param bus face 尚未設定時使用的 1-based CAN bus。
  * @param id face 尚未設定時使用的主要馬達 ID。
- * @param command R、R_、Rw、Rw_ 等 Rubik command。
+ * @param command INIT、R、R2、R_、Rw、Rw2、Rw_ 等 machine-state command。
  * @return 立即啟動狀態；完成、EMS 中止或錯誤由 event queue 回報。
  */
 MotorCAN_Status MotorCAN_StartRotate(uint8_t bus, uint16_t id,
@@ -2830,7 +3331,6 @@ MotorCAN_Status MotorCAN_StartRotate(uint8_t bus, uint16_t id,
   const MachineMotionStage *stage;
   uint8_t stage_index;
   uint8_t index;
-  uint8_t stage_bus;
 
   if (!motor_can_ready) {
     return MOTOR_CAN_STATUS_NOT_READY;
@@ -2861,24 +3361,23 @@ MotorCAN_Status MotorCAN_StartRotate(uint8_t bus, uint16_t id,
     return MOTOR_CAN_STATUS_INVALID_ARGUMENT;
   }
 
-  /* 一個 stage 的 4BH 只能同步同一 bus；不同 stage 可依序使用不同 bus。 */
+  /* 同一 stage 可跨 bus；每條 bus 會各自排入 Synchronization mark 與 4BH。 */
   for (stage_index = 0U; stage_index < plan->stage_count; stage_index++) {
     stage = &plan->stages[stage_index];
     if (stage->motion_count == 0U) {
       MotorCAN_ResetOperation();
       return MOTOR_CAN_STATUS_INVALID_ARGUMENT;
     }
-    stage_bus = stage->motions[0].bus;
-    if ((!MotorCAN_IsValidBus(stage_bus)) ||
-        (!motor_bus_online[stage_bus - 1U])) {
-      MotorCAN_ResetOperation();
-      return MOTOR_CAN_STATUS_NOT_READY;
-    }
     for (index = 0U; index < stage->motion_count; index++) {
-      if ((stage->motions[index].bus != stage_bus) ||
+      const uint8_t motion_bus = stage->motions[index].bus;
+      if ((!MotorCAN_IsValidBus(motion_bus)) ||
           (!MotorCAN_IsValidNodeId(stage->motions[index].id))) {
         MotorCAN_ResetOperation();
         return MOTOR_CAN_STATUS_INVALID_ARGUMENT;
+      }
+      if (!motor_bus_online[motion_bus - 1U]) {
+        MotorCAN_ResetOperation();
+        return MOTOR_CAN_STATUS_NOT_READY;
       }
     }
   }
@@ -3055,6 +3554,7 @@ void MotorCAN_Process(void) {
   MotorCAN_ProcessInitQueue(HAL_GetTick());
   MotorCAN_ProcessHomeStatusPolling(HAL_GetTick());
   MotorCAN_ProcessRotateQueue(HAL_GetTick());
+  MotorCAN_ProcessRotateStatusPolling(HAL_GetTick());
 
   /* ISR 已完成 frame 搬移；此處才做 checksum、command 與 state 判斷。 */
   while (motor_rx_tail != motor_rx_head) {

@@ -22,8 +22,8 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "motor_can.h"
-#include "usb_command.h"
-#include "usb_device.h"
+#include "serial_command.h"
+#include "ssd1306_status.h"
 
 /* USER CODE END Includes */
 
@@ -56,14 +56,14 @@ __IO uint32_t BspButtonState = BUTTON_RELEASED;
 
 /* USER CODE BEGIN PV */
 /*
- * EMS 狀態由 EXTI callback 更新，主迴圈與 USB callback 讀取，所以必須 volatile。
+ * EMS 狀態由 EXTI callback 更新，主迴圈與 UART callback 讀取，所以必須 volatile。
  * HIGH 代表立即停止；HIGH->LOW 後仍保持 command block，直到主迴圈清除 MotorCAN
- * state、CAN RX queue 與 USB RX parser，避免 EMS 期間殘留的命令在釋放後執行。
+ * state、CAN RX queue 與 serial RX parser，避免 EMS 期間殘留的命令在釋放後執行。
  */
 static volatile uint8_t ems_stop_active;
 static volatile uint8_t ems_release_cleanup_pending;
-/* 每次 EMS 釋放只清一次 USB RX，之後仍允許 PING/HELP/STATUS。 */
-static volatile uint8_t ems_usb_cleanup_pending;
+/* 每次 EMS 釋放只清一次 serial RX，之後仍允許 PING/HELP/STATUS。 */
+static volatile uint8_t ems_serial_cleanup_pending;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -119,16 +119,12 @@ int main(void)
    * 專案刻意用邏輯 bus 編號隔離 MCU peripheral 名稱：
    *   bus 1 -> FDCAN3 -> PCB CAN1 接頭
    *   bus 2 -> FDCAN2 -> PCB CAN2 接頭
-   * 後續 USB 命令只看到 bus 1/2，不需要知道 STM32 instance 編號。
+   * 後續 serial 命令只看到 bus 1/2，不需要知道 STM32 instance 編號。
    */
   if (MotorCAN_Init(&hfdcan3, &hfdcan2) != MOTOR_CAN_STATUS_OK)
   {
     Error_Handler();
   }
-
-  /* 先清空 command queue，再啟動 USB CDC，避免列舉 callback 讀到未初始化索引。 */
-  USB_Command_Init();
-  MX_USB_Device_Init();
 
   /* USER CODE END 2 */
 
@@ -138,7 +134,7 @@ int main(void)
   /* Initialize USER push-button, will be used to trigger an interrupt each time it's pressed.*/
   BSP_PB_Init(BUTTON_USER, BUTTON_MODE_EXTI);
 
-  /* Initialize COM1 port (115200, 8 bits (7-bit data + 1 stop bit), no parity */
+  /* NUCLEO ST-LINK VCP 使用 COM1/LPUART1：PA2=TX、PA3=RX、115200 8N1。 */
   BspCOMInit.BaudRate   = 115200;
   BspCOMInit.WordLength = COM_WORDLENGTH_8B;
   BspCOMInit.StopBits   = COM_STOPBITS_1;
@@ -148,11 +144,13 @@ int main(void)
   {
     Error_Handler();
   }
+  if (Serial_Command_Init(&hcom_uart[COM1]) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  SSD1306_Status_Init(&hi2c1);
 
   /* USER CODE BEGIN BSP */
-
-  /* -- Sample board code to send message over COM1 port ---- */
-  printf("Welcome to STM32 world !\n\r");
 
   /* -- Sample board code to switch on led ---- */
   BSP_LED_On(LED_GREEN);
@@ -183,10 +181,10 @@ int main(void)
      */
     if (EMS_IsReleaseCleanupPending())
     {
-      if (ems_usb_cleanup_pending)
+      if (ems_serial_cleanup_pending)
       {
-        USB_Command_ClearPendingCommands();
-        ems_usb_cleanup_pending = 0U;
+        Serial_Command_ClearPendingCommands();
+        ems_serial_cleanup_pending = 0U;
       }
       if (MotorCAN_ClearPendingCommands())
       {
@@ -194,11 +192,12 @@ int main(void)
       }
     }
     /*
-     * 先處理 CAN/EMS，再解析 USB。若本輪剛收到 EMS，MotorCAN 可優先停止動作；
-     * USB command 層則依 EMS_AreCommandsBlocked() 決定是否接受下一條命令。
+     * 先處理 CAN/EMS，再解析 serial。若本輪剛收到 EMS，MotorCAN 可優先停止動作；
+     * serial command 層則依 EMS_AreCommandsBlocked() 決定是否接受下一條命令。
      */
     MotorCAN_Process();
-    USB_Command_Process();
+    Serial_Command_Process();
+    SSD1306_Status_Process();
   }
   /* USER CODE END 3 */
 }
@@ -376,13 +375,13 @@ static void MX_GPIO_Init(void)
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
   /*
-   * 上電時直接採用 EMS 腳位現況。若當下為 HIGH，USB 仍可完成列舉與傳送
+   * 上電時直接採用 EMS 腳位現況。若當下為 HIGH，serial 仍可傳送
    * PING/HELP/STATUS；其餘命令由 parser 回覆 EMS_ACTIVE。
    */
   ems_stop_active =
     (HAL_GPIO_ReadPin(EMS_SW_GPIO_Port, EMS_SW_Pin) == GPIO_PIN_SET) ? 1U : 0U;
   ems_release_cleanup_pending = 0U;
-  ems_usb_cleanup_pending = 0U;
+  ems_serial_cleanup_pending = 0U;
   /* USER CODE END MX_GPIO_Init_2 */
 }
 
@@ -423,7 +422,7 @@ uint8_t EMS_IsReleaseCleanupPending(void)
 void EMS_CompleteReleaseCleanup(void)
 {
   ems_release_cleanup_pending = 0U;
-  ems_usb_cleanup_pending = 0U;
+  ems_serial_cleanup_pending = 0U;
 }
 
 /**
@@ -443,13 +442,13 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
     {
       ems_stop_active = 1U;
       ems_release_cleanup_pending = 0U;
-      ems_usb_cleanup_pending = 0U;
+      ems_serial_cleanup_pending = 0U;
     }
     else
     {
       ems_stop_active = 0U;
       ems_release_cleanup_pending = 1U;
-      ems_usb_cleanup_pending = 1U;
+      ems_serial_cleanup_pending = 1U;
     }
   }
 }

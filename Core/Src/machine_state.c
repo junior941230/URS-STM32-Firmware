@@ -5,6 +5,8 @@
 #include <stdint.h>
 #include <string.h>
 
+#define MAX_RPM 3000U
+
 static MachineState machine_state;
 
 static FaceModule *MachineState_GetFaceModule(MachineFace face) {
@@ -27,28 +29,31 @@ static FaceModule *MachineState_GetFaceModule(MachineFace face) {
 }
 
 static uint8_t MachineState_ParseCommand(const char *text,
-                                         Rotate_Command_Type *command) {
+                                         Rotate_Command_Type *command,
+                                         uint8_t *command_multiplier) {
   static const struct {
     const char *name;
     Rotate_Command_Type command;
   } command_table[] = {
-      {"R", ROTATE_COMMAND_R},   {"R_", ROTATE_COMMAND_R_PRIME},
-      {"L", ROTATE_COMMAND_L},   {"L_", ROTATE_COMMAND_L_PRIME},
-      {"U", ROTATE_COMMAND_U},   {"U_", ROTATE_COMMAND_U_PRIME},
-      {"D", ROTATE_COMMAND_D},   {"D_", ROTATE_COMMAND_D_PRIME},
-      {"F", ROTATE_COMMAND_F},   {"F_", ROTATE_COMMAND_F_PRIME},
-      {"B", ROTATE_COMMAND_B},   {"B_", ROTATE_COMMAND_B_PRIME},
-      {"RW", ROTATE_COMMAND_RW}, {"RW_", ROTATE_COMMAND_RW_PRIME},
-      {"LW", ROTATE_COMMAND_LW}, {"LW_", ROTATE_COMMAND_LW_PRIME},
-      {"UW", ROTATE_COMMAND_UW}, {"UW_", ROTATE_COMMAND_UW_PRIME},
-      {"DW", ROTATE_COMMAND_DW}, {"DW_", ROTATE_COMMAND_DW_PRIME},
-      {"FW", ROTATE_COMMAND_FW}, {"FW_", ROTATE_COMMAND_FW_PRIME},
-      {"BW", ROTATE_COMMAND_BW}, {"BW_", ROTATE_COMMAND_BW_PRIME}};
-  char normalized[4] = {0};
+      {"R", ROTATE_COMMAND_R},      {"R_", ROTATE_COMMAND_R_PRIME},
+      {"L", ROTATE_COMMAND_L},      {"L_", ROTATE_COMMAND_L_PRIME},
+      {"U", ROTATE_COMMAND_U},      {"U_", ROTATE_COMMAND_U_PRIME},
+      {"D", ROTATE_COMMAND_D},      {"D_", ROTATE_COMMAND_D_PRIME},
+      {"F", ROTATE_COMMAND_F},      {"F_", ROTATE_COMMAND_F_PRIME},
+      {"B", ROTATE_COMMAND_B},      {"B_", ROTATE_COMMAND_B_PRIME},
+      {"RW", ROTATE_COMMAND_RW},    {"RW_", ROTATE_COMMAND_RW_PRIME},
+      {"LW", ROTATE_COMMAND_LW},    {"LW_", ROTATE_COMMAND_LW_PRIME},
+      {"UW", ROTATE_COMMAND_UW},    {"UW_", ROTATE_COMMAND_UW_PRIME},
+      {"DW", ROTATE_COMMAND_DW},    {"DW_", ROTATE_COMMAND_DW_PRIME},
+      {"FW", ROTATE_COMMAND_FW},    {"FW_", ROTATE_COMMAND_FW_PRIME},
+      {"BW", ROTATE_COMMAND_BW},    {"BW_", ROTATE_COMMAND_BW_PRIME},
+      {"INIT", ROTATE_COMMAND_INIT}};
+  char normalized[6] = {0};
   size_t length;
   size_t index;
+  uint8_t multiplier = 1U;
 
-  if ((text == NULL) || (command == NULL)) {
+  if ((text == NULL) || (command == NULL) || (command_multiplier == NULL)) {
     return 0U;
   }
 
@@ -59,11 +64,23 @@ static uint8_t MachineState_ParseCommand(const char *text,
   for (index = 0U; index < length; index++) {
     normalized[index] = (char)toupper((unsigned char)text[index]);
   }
+  if ((length >= 2U) && (normalized[length - 1U] == '2')) {
+    if (normalized[length - 2U] == '_') {
+      return 0U;
+    }
+    normalized[length - 1U] = '\0';
+    multiplier = 2U;
+  }
 
   for (index = 0U; index < (sizeof(command_table) / sizeof(command_table[0]));
        index++) {
     if (strcmp(normalized, command_table[index].name) == 0) {
+      if ((multiplier == 2U) &&
+          (command_table[index].command == ROTATE_COMMAND_INIT)) {
+        return 0U;
+      }
       *command = command_table[index].command;
+      *command_multiplier = multiplier;
       return 1U;
     }
   }
@@ -196,22 +213,31 @@ MachineState_PlanAddFaceMotion(MachineMotionPlan *plan, uint8_t stage_index,
 }
 static MachinePlanStatus FaceModule_Macro(MachineMotionPlan *plan,
                                           uint8_t stage, MachineFace face,
-                                          uint16_t rpm, uint8_t acc,
+                                          uint16_t big_rpm, uint8_t big_acc,
                                           double angle_degrees) {
   MachinePlanStatus status;
-  status = MachineState_PlanAddFaceMotion(
-      plan, stage, face, MACHINE_MOTOR_SMALL, rpm, acc, angle_degrees);
+  uint8_t small_acc = (uint8_t)(256U - (256U - big_acc) / 0.5);
+  uint16_t small_rpm = (uint16_t)(big_rpm * 0.5);
+  status =
+      MachineState_PlanAddFaceMotion(plan, stage, face, MACHINE_MOTOR_SMALL,
+                                     small_rpm, small_acc, angle_degrees);
   if (status != MACHINE_PLAN_OK) {
     return status;
   }
-  return MachineState_PlanAddFaceMotion(
-      plan, stage, face, MACHINE_MOTOR_BIG, (uint16_t)(rpm * 2U),
-      (uint8_t)(acc * 2U), angle_degrees * 2.0);
+
+  return MachineState_PlanAddFaceMotion(plan, stage, face, MACHINE_MOTOR_BIG,
+                                        (uint16_t)(big_rpm), big_acc,
+                                        angle_degrees * 2.0);
 }
 
 static MachinePlanStatus
 MachineState_AddPreparationStages(Rotate_Command_Type command,
                                   MachineMotionPlan *plan) {
+  const uint8_t command_multiplier = plan->command_multiplier;
+  const Rotate_Command_Type Last_command = machine_state.Last_command;
+
+  /* 各 command case 可直接使用這兩個變數，不需要增加 R2/L2/... case。 */
+  (void)Last_command;
   /*
    * 在這裡編排「目標 face 轉動前」的準備 stage。
    * 同一個 stage 內可加入多顆馬達，它們會用 4AH/4BH 同步啟動。
@@ -236,18 +262,59 @@ MachineState_AddPreparationStages(Rotate_Command_Type command,
    *     200U, 2U, 20.0);
    * 最後會自動執行第 3 組：RIGHT big motor。
    */
-  switch (command) {
-  case ROTATE_COMMAND_R: {
-    uint8_t stage;
-    MachinePlanStatus status;
+  uint8_t stage;
+  MachinePlanStatus status;
+  if (Last_command == ROTATE_COMMAND_INIT) {
+    status = MachineState_PlanAddStage(plan, &stage);
+    if (status != MACHINE_PLAN_OK) {
+      return status;
+    }
+    status =
+        FaceModule_Macro(plan, stage, MACHINE_FACE_FRONT, MAX_RPM, 255U, 90.0);
+    if (status != MACHINE_PLAN_OK) {
+      return status;
+    }
+    status =
+        FaceModule_Macro(plan, stage, MACHINE_FACE_BACK, MAX_RPM, 255U, 90.0);
+    if (status != MACHINE_PLAN_OK) {
+      return status;
+    }
+  }
 
+  switch (command) {
+  case ROTATE_COMMAND_INIT: // 初始化動作
     status = MachineState_PlanAddStage(plan, &stage);
     if (status != MACHINE_PLAN_OK) {
       return status;
     }
 
-    return FaceModule_Macro(plan, stage, MACHINE_FACE_LEFT, 200U, 2U, 20.0);
-  }
+    status = MachineState_PlanAddFaceMotion(plan, stage, MACHINE_FACE_LEFT,
+                                            MACHINE_MOTOR_SMALL, MAX_RPM, 255U,
+                                            90.0);
+    if (status != MACHINE_PLAN_OK) {
+      return status;
+    }
+    status = MachineState_PlanAddFaceMotion(plan, stage, MACHINE_FACE_RIGHT,
+                                            MACHINE_MOTOR_SMALL, MAX_RPM, 255U,
+                                            90.0);
+    if (status != MACHINE_PLAN_OK) {
+      return status;
+    }
+    status = MachineState_PlanAddStage(plan, &stage);
+    if (status != MACHINE_PLAN_OK) {
+      return status;
+    }
+    return MachineState_PlanAddFaceMotion(plan, stage, MACHINE_FACE_DOWN,
+                                          MACHINE_MOTOR_SMALL, MAX_RPM, 255U,
+                                          90.0);
+
+  case ROTATE_COMMAND_R: // 初始化動作
+    status = MachineState_PlanAddStage(plan, &stage);
+    if (status != MACHINE_PLAN_OK) {
+      return status;
+    }
+    return FaceModule_Macro(plan, stage, MACHINE_FACE_DOWN, MAX_RPM, 255U,
+                            360.0 * (double)command_multiplier);
   case ROTATE_COMMAND_R_PRIME:
   case ROTATE_COMMAND_L:
   case ROTATE_COMMAND_L_PRIME:
@@ -255,7 +322,7 @@ MachineState_AddPreparationStages(Rotate_Command_Type command,
   case ROTATE_COMMAND_U_PRIME:
   case ROTATE_COMMAND_D:
   case ROTATE_COMMAND_D_PRIME:
-  
+
   case ROTATE_COMMAND_F:
   case ROTATE_COMMAND_F_PRIME:
   case ROTATE_COMMAND_B:
@@ -281,6 +348,7 @@ MachineState_AddPreparationStages(Rotate_Command_Type command,
 
 void MachineState_Init(void) {
   memset(&machine_state, 0, sizeof(machine_state));
+  machine_state.Last_command = ROTATE_COMMAND_INIT;
   machine_state.left_module.small_motor_state = MOTOR_ANGLE_NONE_SIDE;
   machine_state.right_module.small_motor_state = MOTOR_ANGLE_NONE_SIDE;
   machine_state.up_module.small_motor_state = MOTOR_ANGLE_NONE_SIDE;
@@ -304,8 +372,8 @@ void MachineState_Init(void) {
    */
   MachineState_ConfigureFace(MACHINE_FACE_FRONT, 1U, 12U, 13U, 1U);
   MachineState_ConfigureFace(MACHINE_FACE_BACK, 2U, 10U, 11U, 1U);
-  MachineState_ConfigureFace(MACHINE_FACE_LEFT, 1U, 8U, 9U, 1U);
-  MachineState_ConfigureFace(MACHINE_FACE_RIGHT, 2U, 4U, 5U, 1U);
+  MachineState_ConfigureFace(MACHINE_FACE_RIGHT, 1U, 8U, 9U, 1U);
+  MachineState_ConfigureFace(MACHINE_FACE_LEFT, 2U, 4U, 5U, 1U);
   MachineState_ConfigureFace(MACHINE_FACE_UP, 1U, 2U, 3U, 1U);
   MachineState_ConfigureFace(MACHINE_FACE_DOWN, 2U, 6U, 7U, 1U);
 }
@@ -331,27 +399,42 @@ MachinePlanStatus MachineState_BuildRotatePlan(uint8_t fallback_bus,
                                                const char *command_text,
                                                MachineMotionPlan *plan) {
   Rotate_Command_Type command;
+  uint8_t command_multiplier;
   FaceModule *module;
   MachinePlanStatus status;
 
   if ((plan == NULL) || (fallback_bus < 1U) || (fallback_bus > 2U) ||
       (fallback_id < 1U) || (fallback_id > 0x7FFU) ||
-      (!MachineState_ParseCommand(command_text, &command))) {
+      (!MachineState_ParseCommand(command_text, &command,
+                                  &command_multiplier))) {
     return MACHINE_PLAN_INVALID_ARGUMENT;
   }
 
   memset(plan, 0, sizeof(*plan));
   plan->command = command;
-  module = MachineState_GetFaceModule(MachineState_CommandFace(command));
-  if (module == NULL) {
-    return MACHINE_PLAN_INVALID_ARGUMENT;
+  plan->command_multiplier = command_multiplier;
+  if (command != ROTATE_COMMAND_INIT) {
+    module = MachineState_GetFaceModule(MachineState_CommandFace(command));
+    if (module == NULL) {
+      return MACHINE_PLAN_INVALID_ARGUMENT;
+    }
   }
 
   status = MachineState_AddPreparationStages(command, plan);
   return status;
 }
 
-void MachineState_CommitRotate(Rotate_Command_Type command) {
+void MachineState_CommitRotate(Rotate_Command_Type command,
+                               uint8_t command_multiplier) {
+  if ((command_multiplier < 1U) || (command_multiplier > 2U)) {
+    return;
+  }
+  machine_state.Last_command = command;
+  if (command == ROTATE_COMMAND_INIT) {
+    /* INIT 若會改變 logical state，可在這裡加入對應的狀態更新。 */
+    return;
+  }
+
   FaceModule *module =
       MachineState_GetFaceModule(MachineState_CommandFace(command));
   int16_t delta;
@@ -359,7 +442,8 @@ void MachineState_CommitRotate(Rotate_Command_Type command) {
   if (module == NULL) {
     return;
   }
-  delta = MachineState_CommandIsPrime(command) ? -90 : 90;
+  delta = (int16_t)((MachineState_CommandIsPrime(command) ? -90 : 90) *
+                    (int16_t)command_multiplier);
   module->big_motor_angle_degrees =
       (int16_t)(module->big_motor_angle_degrees + delta);
 

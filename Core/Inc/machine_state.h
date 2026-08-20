@@ -42,7 +42,8 @@ typedef enum
   ROTATE_COMMAND_FW,
   ROTATE_COMMAND_FW_PRIME,
   ROTATE_COMMAND_BW,
-  ROTATE_COMMAND_BW_PRIME
+  ROTATE_COMMAND_BW_PRIME,
+  ROTATE_COMMAND_INIT
 } Rotate_Command_Type;
 
 typedef enum
@@ -79,6 +80,7 @@ typedef struct
   FaceModule down_module;
   FaceModule front_module;
   FaceModule back_module;
+  Rotate_Command_Type Last_command;
 } MachineState;
 
 typedef struct
@@ -99,6 +101,7 @@ typedef struct
 typedef struct
 {
   Rotate_Command_Type command;
+  uint8_t command_multiplier;
   uint8_t stage_count;
   MachineMotionStage stages[MACHINE_STATE_MAX_STAGES];
 } MachineMotionPlan;
@@ -149,7 +152,7 @@ void MachineState_ConfigureFace(MachineFace face, uint8_t bus,
   * @brief 解析 Rubik command，依目前 machine state 產生同步馬達動作清單。
   * @param fallback_bus face 尚未設定時使用的 bus。
   * @param fallback_id face 尚未設定時使用的主要馬達 ID。
-  * @param command R、R_、Rw、Rw_ 等命令字串，不分大小寫。
+  * @param command INIT、R、R2、R_、Rw、Rw2、Rw_ 等命令字串，不分大小寫。
   * @param plan 成功時接收完整動作清單。
   */
 MachinePlanStatus MachineState_BuildRotatePlan(uint8_t fallback_bus,
@@ -157,8 +160,9 @@ MachinePlanStatus MachineState_BuildRotatePlan(uint8_t fallback_bus,
                                                const char *command,
                                                MachineMotionPlan *plan);
 
-/** @brief 同步動作完成後，把 command 套用到 machine state。 */
-void MachineState_CommitRotate(Rotate_Command_Type command);
+/** @brief 同步動作完成後，把 command 與倍數套用到 machine state。 */
+void MachineState_CommitRotate(Rotate_Command_Type command,
+                               uint8_t command_multiplier);
 
 /** @brief 取得目前 machine state 的唯讀 view。 */
 const MachineState *MachineState_Get(void);

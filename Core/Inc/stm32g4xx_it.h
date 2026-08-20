@@ -59,7 +59,7 @@ void EXTI2_IRQHandler(void);
 void EXTI15_10_IRQHandler(void);
 void FDCAN2_IT0_IRQHandler(void);
 void FDCAN3_IT0_IRQHandler(void);
-void USB_LP_IRQHandler(void);
+void LPUART1_IRQHandler(void);
 /* USER CODE BEGIN EFP */
 
 /* USER CODE END EFP */

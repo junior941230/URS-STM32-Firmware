@@ -1,9 +1,8 @@
-#include "usb_command.h"
+#include "serial_command.h"
 
 #include "main.h"
 #include "motor_can.h"
-#include "usbd_cdc_if.h"
-
+#include "ssd1306_status.h"
 #include <ctype.h>
 #include <errno.h>
 #include <stdarg.h>
@@ -13,11 +12,11 @@
 #include <string.h>
 
 /*
- * USB CDC 文字命令層
- * -----------------
- * CDC receive callback 只把 bytes 放入 RX ring buffer；主迴圈再組成一行、
+ * NUCLEO ST-LINK VCP 文字命令層
+ * ---------------------------
+ * LPUART1 receive callback 只把 bytes 放入 RX ring buffer；主迴圈再組成一行、
  * 驗證參數並呼叫 MotorCAN_Start*()。Motor CAN 的完成事件會轉成一行文字，
- * 放入 TX queue，最後由 CDC transmit-complete callback 釋放 slot。
+ * 放入 TX queue，最後由 UART transmit-complete callback 釋放 slot。
  *
  * 所有回覆以 CRLF 結尾。命令不分大小寫，bus 與 CAN ID 可用十進位，
  * CAN ID 也可用 0x 前綴的十六進位表示。
@@ -27,11 +26,11 @@
  */
 #define USB_COMMAND_RX_QUEUE_SIZE 256U
 #define USB_COMMAND_LINE_SIZE 96U
-#define USB_COMMAND_TX_QUEUE_SIZE 8U
+#define USB_COMMAND_TX_QUEUE_SIZE 16U
 #define USB_COMMAND_TX_MESSAGE_SIZE 192U
 
 /*
- * RX queue 是 single-producer/single-consumer ring buffer：USB callback 寫
+ * RX queue 是 single-producer/single-consumer ring buffer：UART callback 寫
  * head， 主迴圈讀 tail。滿載時設 overflow，主迴圈稍後回報錯誤而不阻塞
  * callback。
  */
@@ -41,8 +40,8 @@ static volatile uint16_t usb_rx_tail;
 static volatile uint8_t usb_rx_overflow;
 
 /*
- * TX queue 由主迴圈寫入；USB transmit-complete callback 移動 tail。
- * usb_tx_inflight=1 代表 tail 指向的 slot 仍由 USB peripheral 使用，不可覆寫。
+ * TX queue 由主迴圈寫入；UART transmit-complete callback 移動 tail。
+ * usb_tx_inflight=1 代表 tail 指向的 slot 仍由 UART peripheral 使用，不可覆寫。
  */
 static char usb_tx_queue[USB_COMMAND_TX_QUEUE_SIZE]
                         [USB_COMMAND_TX_MESSAGE_SIZE];
@@ -54,8 +53,14 @@ static char usb_line[USB_COMMAND_LINE_SIZE];
 static uint16_t usb_line_length;
 static uint8_t usb_line_overflow;
 
+/* COM1 是 NUCLEO ST-LINK VCP 對應的 LPUART1，PA2=TX、PA3=RX。 */
+static UART_HandleTypeDef *command_uart;
+static uint8_t command_uart_rx_byte;
+static volatile uint8_t command_uart_rx_armed;
+static volatile uint8_t command_uart_error;
+
 /**
- * @brief 格式化一行文字、補上 CRLF，並放入 USB TX ring buffer。
+ * @brief 格式化一行文字、補上 CRLF，並放入 serial TX ring buffer。
  * @param format printf-style 格式字串，後面可帶對應 variadic arguments。
  * @retval 無。
  * @note queue 滿時直接保留既有回覆並捨棄新訊息，不阻塞主迴圈。
@@ -68,7 +73,7 @@ static void USB_Command_QueueText(const char *format, ...) {
   /* ring buffer 保留一格；next==tail 代表 queue 已滿。 */
   next = (uint8_t)((usb_tx_head + 1U) % USB_COMMAND_TX_QUEUE_SIZE);
   if (next == usb_tx_tail) {
-    /* USB host 未讀取時不阻塞主迴圈，保留既有回覆。 */
+    /* 上位機來不及接收時不阻塞主迴圈，保留既有回覆。 */
     return;
   }
 
@@ -118,7 +123,7 @@ static const char *USB_Command_OperationName(MotorCAN_Operation operation) {
 }
 
 /**
- * @brief 把 MotorCAN_Error 轉成 USB 文字協定的錯誤名稱。
+ * @brief 把 MotorCAN_Error 轉成 serial 文字協定的錯誤名稱。
  * @param error Motor CAN 錯誤列舉值。
  * @return 靜態唯讀字串；未知值回傳 "UNKNOWN"。
  */
@@ -152,7 +157,7 @@ static const char *USB_Command_ErrorName(MotorCAN_Error error) {
 }
 
 /**
- * @brief 把 MotorCAN_Start*() 的立即狀態轉成 USB 文字協定名稱。
+ * @brief 把 MotorCAN_Start*() 的立即狀態轉成 serial 文字協定名稱。
  * @param status Motor CAN 啟動狀態。
  * @return 靜態唯讀字串；未列出的值回傳 "UNKNOWN"。
  * @note MOTOR_CAN_STATUS_OK 由 ReportStartStatus() 直接處理，不需要文字
@@ -293,7 +298,7 @@ static uint8_t USB_Command_HasExtraToken(void) {
 }
 
 /**
- * @brief 解析並執行一條完整 USB CDC 文字命令。
+ * @brief 解析並執行一條完整 serial 文字命令。
  * @param line 可修改的 NUL-terminated command line buffer。
  * @retval 無。
  * @note 會原地轉大寫並用 strtok() 切 token；所有輸入先完整驗證才呼叫 MotorCAN。
@@ -311,8 +316,8 @@ static void USB_Command_ExecuteLine(char *line) {
   char *token_timeout;
   char *token_confirm;
   char *token_command;
-  char *token_big_offset;
-  char *token_small_offset;
+  char *token_big_additional_offset;
+  char *token_small_additional_offset;
   uint16_t bus_value;
   uint16_t id_value;
   uint16_t new_id_value;
@@ -321,9 +326,10 @@ static void USB_Command_ExecuteLine(char *line) {
   uint16_t low_speed_value;
   uint8_t direction_value;
   double offset_value;
-  double big_offset_value;
-  double small_offset_value;
+  double big_additional_offset_value;
+  double small_additional_offset_value;
   uint32_t timeout_value;
+  uint32_t elapsed_ms;
   MotorCAN_Status status;
   size_t index;
 
@@ -357,14 +363,17 @@ static void USB_Command_ExecuteLine(char *line) {
     USB_Command_QueueText("PROVISION_1M <bus> <id> CONFIRM");
     USB_Command_QueueText("SET_ID <bus> <old_id> <new_id> CONFIRM");
     USB_Command_QueueText(
-        "INIT [<big_offset_angle_deg> <small_offset_angle_deg>] CONFIRM");
+        "INIT [<big_extra_offset_deg> <small_extra_offset_deg>] CONFIRM");
     USB_Command_QueueText("TEST <bus> <id> CONFIRM  (30RPM,500ms)");
     USB_Command_QueueText("HOME <bus> <id> <FWD|REV> <high_rpm> <low_rpm> "
                           "<offset_angle_deg> <timeout_ms> CONFIRM");
+    USB_Command_QueueText("TIMER <START|END>");
     USB_Command_QueueText("STATUS | PING | HELP");
-    USB_Command_QueueText("ROTATE <bus> <id> "
-                          "<R|R_|L|L_|U|U_|D|D_|F|F_|B|B_|Rw|Rw_|Lw|Lw_|Uw|Uw_|"
-                          "Dw|Dw_|Fw|Fw_|Bw|Bw_> CONFIRM");
+    USB_Command_QueueText(
+        "ROTATE <bus> <id> "
+        "<INIT|R|R2|R_|L|L2|L_|U|U2|U_|D|D2|D_|F|F2|F_|B|B2|B_|"
+        "Rw|Rw2|Rw_|Lw|Lw2|Lw_|Uw|Uw2|Uw_|Dw|Dw2|Dw_|Fw|Fw2|Fw_|"
+        "Bw|Bw2|Bw_> CONFIRM");
     return;
   }
 
@@ -383,6 +392,34 @@ static void USB_Command_ExecuteLine(char *line) {
     return;
   }
 
+  /* TIMER 是本機計時與 OLED 顯示命令，不會送出 CAN frame。 */
+  if (strcmp(command, "TIMER") == 0) {
+    token_command = strtok(NULL, " \t");
+    if ((token_command == NULL) || USB_Command_HasExtraToken()) {
+      USB_Command_QueueText("ERR TIMER SYNTAX");
+      return;
+    }
+    if (strcmp(token_command, "START") == 0) {
+      if (!SSD1306_Status_TimerStart()) {
+        USB_Command_QueueText("ERR TIMER ALREADY_RUNNING");
+        return;
+      }
+      USB_Command_QueueText("OK TIMER STARTED");
+      return;
+    }
+    if (strcmp(token_command, "END") == 0) {
+      if (!SSD1306_Status_TimerEnd(&elapsed_ms)) {
+        USB_Command_QueueText("ERR TIMER NOT_RUNNING");
+        return;
+      }
+      USB_Command_QueueText("OK TIMER ENDED elapsed_ms=%lu",
+                            (unsigned long)elapsed_ms);
+      return;
+    }
+    USB_Command_QueueText("ERR TIMER SYNTAX");
+    return;
+  }
+
   /*
    * EMS 啟動或釋放清理期間，只允許不會操作馬達的本機查詢。
    * RX 仍持續解析，所以上位機不會把「連線正常」誤判成無回應。
@@ -392,37 +429,40 @@ static void USB_Command_ExecuteLine(char *line) {
     return;
   }
 
-  /* CAN_RATE 只改 STM32 controller 的 bitrate，不會修改馬達內部設定。 */
+  /* INIT 的選填角度會追加到韌體內建的 big/small 預設 offset。 */
   if (strcmp(command, "INIT") == 0) {
-    token_big_offset = strtok(NULL, " \t");
-    if (token_big_offset == NULL) {
+    token_big_additional_offset = strtok(NULL, " \t");
+    if (token_big_additional_offset == NULL) {
       USB_Command_QueueText("ERR INIT SYNTAX_OR_CONFIRM");
       return;
     }
-    if (strcmp(token_big_offset, "CONFIRM") == 0) {
+    if (strcmp(token_big_additional_offset, "CONFIRM") == 0) {
       if (USB_Command_HasExtraToken()) {
         USB_Command_QueueText("ERR INIT SYNTAX_OR_CONFIRM");
         return;
       }
       status = MotorCAN_StartInit();
     } else {
-      token_small_offset = strtok(NULL, " \t");
+      token_small_additional_offset = strtok(NULL, " \t");
       token_confirm = strtok(NULL, " \t");
-      if ((!USB_Command_ParseDouble(token_big_offset, &big_offset_value)) ||
-          (!USB_Command_ParseDouble(token_small_offset, &small_offset_value)) ||
+      if ((!USB_Command_ParseDouble(token_big_additional_offset,
+                                    &big_additional_offset_value)) ||
+          (!USB_Command_ParseDouble(token_small_additional_offset,
+                                    &small_additional_offset_value)) ||
           (token_confirm == NULL) ||
           (strcmp(token_confirm, "CONFIRM") != 0) ||
           USB_Command_HasExtraToken()) {
         USB_Command_QueueText("ERR INIT SYNTAX_OR_CONFIRM");
         return;
       }
-      status = MotorCAN_StartInitWithOffsetAngles(big_offset_value,
-                                                   small_offset_value);
+      status = MotorCAN_StartInitWithOffsetAngles(big_additional_offset_value,
+                                                   small_additional_offset_value);
     }
     USB_Command_ReportStartStatus(status, "INIT");
     return;
   }
 
+  /* CAN_RATE 只改 STM32 controller 的 bitrate，不會修改馬達內部設定。 */
   if (strcmp(command, "CAN_RATE") == 0) {
     token_bus = strtok(NULL, " \t");
     token_rate = strtok(NULL, " \t");
@@ -599,7 +639,7 @@ static void USB_Command_ExecuteLine(char *line) {
  */
 static void USB_Command_ProcessRx(void) {
   /*
-   * CDC 是 byte stream，一個 USB packet 可能包含半行、多行或行尾拆包。
+   * UART 是 byte stream，一次處理可能只收到半行，也可能累積多行。
    * 因此逐 byte 累積，遇到 CR 或 LF 才執行完整命令。連續 CRLF 的第二個
    * 分隔字元會因 line_length=0 而被忽略。
    */
@@ -633,12 +673,16 @@ static void USB_Command_ProcessRx(void) {
 
   if (usb_rx_overflow) {
     usb_rx_overflow = 0U;
-    USB_Command_QueueText("ERR USB_RX_OVERFLOW");
+    USB_Command_QueueText("ERR SERIAL_RX_OVERFLOW");
+  }
+  if (command_uart_error) {
+    command_uart_error = 0U;
+    USB_Command_QueueText("ERR SERIAL_RX_ERROR");
   }
 }
 
 /**
- * @brief 取出所有 MotorCAN_Event，轉成 USB 文字協定並排入 TX queue。
+ * @brief 取出所有 MotorCAN_Event，轉成 serial 文字協定並排入 TX queue。
  * @retval 無。
  * @note 會處理 INFO、SET_ID、PROVISION_1M、TEST、HOME、ROTATE 與一般 CAN 錯誤。
  */
@@ -698,7 +742,8 @@ static void USB_Command_ProcessMotorEvents(void) {
 
     case MOTOR_CAN_EVENT_INIT_FINISHED:
       USB_Command_QueueText(
-          "OK INIT big=6 synchronized=1 small=6 sequential=1 complete");
+          "OK INIT big=6 sequential=1 small=6 sequential=1 "
+          "order=small_then_big complete");
       break;
 
     case MOTOR_CAN_EVENT_INIT_STOPPED_BY_EMS:
@@ -739,35 +784,37 @@ static void USB_Command_ProcessMotorEvents(void) {
 }
 
 /**
- * @brief 若 USB 沒有傳送中的封包，嘗試送出 TX queue 最舊的一行。
+ * @brief 若 LPUART1 沒有傳送中的封包，嘗試送出 TX queue 最舊的一行。
  * @retval 無。
- * @note USBD_BUSY/FAIL 時保留原 tail，下一輪主迴圈會重試同一筆資料。
+ * @note HAL_BUSY/ERROR 時保留原 tail，下一輪主迴圈會重試同一筆資料。
  */
 static void USB_Command_ProcessTx(void) {
-  uint8_t result;
+  HAL_StatusTypeDef result;
 
-  if (usb_tx_inflight || (usb_tx_tail == usb_tx_head)) {
+  if ((command_uart == NULL) || usb_tx_inflight ||
+      (usb_tx_tail == usb_tx_head)) {
     return;
   }
 
   /*
-   * 先標示 inflight，再啟動 USB 傳送，避免極短封包的 complete callback
-   * 早於狀態更新。USBD_BUSY 時保留同一個 tail，下一輪主迴圈再重試。
+   * 先標示 inflight，再啟動 UART interrupt 傳送，避免極短封包的 complete
+   * callback 早於狀態更新。HAL_BUSY 時保留同一個 tail，下一輪再重試。
    */
   usb_tx_inflight = 1U;
-  result = CDC_Transmit_FS((uint8_t *)usb_tx_queue[usb_tx_tail],
-                           (uint16_t)strlen(usb_tx_queue[usb_tx_tail]));
-  if (result != USBD_OK) {
+  result = HAL_UART_Transmit_IT(
+      command_uart, (uint8_t *)usb_tx_queue[usb_tx_tail],
+      (uint16_t)strlen(usb_tx_queue[usb_tx_tail]));
+  if (result != HAL_OK) {
     usb_tx_inflight = 0U;
   }
 }
 
 /**
- * @brief 將 USB command 模組的 RX、line parser 與 TX queue 重設為空。
- * @retval 無。
- * @note 在啟動 USB Device 前呼叫，確保列舉 callback 看到已初始化狀態。
+ * @brief 初始化 LPUART1 command 模組、queue 與第一筆 RX interrupt。
+ * @param uart NUCLEO COM1 的 UART handle。
+ * @retval HAL_OK 表示 UART RX interrupt 已啟動；否則為 HAL_ERROR。
  */
-void USB_Command_Init(void) {
+HAL_StatusTypeDef Serial_Command_Init(UART_HandleTypeDef *uart) {
   usb_rx_head = 0U;
   usb_rx_tail = 0U;
   usb_rx_overflow = 0U;
@@ -776,6 +823,24 @@ void USB_Command_Init(void) {
   usb_tx_inflight = 0U;
   usb_line_length = 0U;
   usb_line_overflow = 0U;
+  command_uart = uart;
+  command_uart_rx_byte = 0U;
+  command_uart_rx_armed = 0U;
+  command_uart_error = 0U;
+
+  if ((command_uart == NULL) || (command_uart->Instance != LPUART1)) {
+    return HAL_ERROR;
+  }
+
+  /* UART command traffic 維持低於 EMS/CAN 的 priority 6。 */
+  HAL_NVIC_SetPriority(LPUART1_IRQn, 6U, 0U);
+  HAL_NVIC_ClearPendingIRQ(LPUART1_IRQn);
+  HAL_NVIC_EnableIRQ(LPUART1_IRQn);
+  if (HAL_UART_Receive_IT(command_uart, &command_uart_rx_byte, 1U) != HAL_OK) {
+    return HAL_ERROR;
+  }
+  command_uart_rx_armed = 1U;
+  return HAL_OK;
 }
 
 /**
@@ -783,7 +848,13 @@ void USB_Command_Init(void) {
  * @retval 無。
  * @note EMS blocked 時仍解析本機查詢；會操作馬達的命令由 parser 拒絕。
  */
-void USB_Command_Process(void) {
+void Serial_Command_Process(void) {
+  /* 若 error callback 當下無法重啟 RX，主迴圈會持續嘗試直到成功。 */
+  if ((command_uart != NULL) && !command_uart_rx_armed &&
+      (HAL_UART_Receive_IT(command_uart, &command_uart_rx_byte, 1U) == HAL_OK)) {
+    command_uart_rx_armed = 1U;
+  }
+
   /*
    * RX parser 必須持續運作，讓 PING/HELP/STATUS 在 EMS 期間仍可回覆；
    * 其他命令會在 USB_Command_ExecuteLine() 回覆 EMS_ACTIVE。
@@ -796,12 +867,12 @@ void USB_Command_Process(void) {
 /**
  * @brief EMS 釋放後丟棄尚未解析的 RX bytes 與半條 command line。
  * @retval 無。
- * @note 以保留 PRIMASK 的臨界區同步 USB callback 寫入的 RX head。
+ * @note 以保留 PRIMASK 的臨界區同步 UART callback 寫入的 RX head。
  */
-void USB_Command_ClearPendingCommands(void) {
+void Serial_Command_ClearPendingCommands(void) {
   uint32_t primask = __get_PRIMASK();
 
-  /* RX head 由 USB callback 更新；以 PRIMASK 保護 head/tail 同步。 */
+  /* RX head 由 UART callback 更新；以 PRIMASK 保護 head/tail 同步。 */
   __disable_irq();
   usb_rx_tail = usb_rx_head;
   usb_rx_overflow = 0U;
@@ -814,13 +885,13 @@ void USB_Command_ClearPendingCommands(void) {
 }
 
 /**
- * @brief 接收 CDC OUT packet，逐 byte 寫入 USB command RX ring buffer。
- * @param data CDC class 提供的 packet buffer。
- * @param length packet 內有效 byte 數。
+ * @brief 將 UART RX callback 收到的 bytes 寫入 command RX ring buffer。
+ * @param data UART 收到的 byte buffer。
+ * @param length buffer 內有效 byte 數。
  * @retval 無。
- * @note 在 USB callback context 執行；只搬移資料，queue 滿時設 overflow。
+ * @note 在 UART callback context 執行；只搬移資料，queue 滿時設 overflow。
  */
-void USB_Command_OnReceive(const uint8_t *data, uint32_t length) {
+static void USB_Command_OnReceive(const uint8_t *data, uint32_t length) {
   uint32_t index;
 
   if (data == NULL) {
@@ -838,26 +909,45 @@ void USB_Command_OnReceive(const uint8_t *data, uint32_t length) {
 }
 
 /**
- * @brief 通知 command 層目前 CDC IN transfer 已完成，可釋放 TX tail slot。
+ * @brief 通知 command 層目前 UART transfer 已完成，可釋放 TX tail slot。
  * @retval 無。
- * @note 在 USB transmit-complete callback context 執行。
+ * @note 在 UART transmit-complete callback context 執行。
  */
-void USB_Command_OnTransmitComplete(void) {
-  /* USB peripheral 已不再引用 tail slot，現在才能釋放並讓下一筆傳送。 */
+static void USB_Command_OnTransmitComplete(void) {
+  /* UART peripheral 已不再引用 tail slot，現在才能釋放並讓下一筆傳送。 */
   if (usb_tx_inflight) {
     usb_tx_tail = (uint8_t)((usb_tx_tail + 1U) % USB_COMMAND_TX_QUEUE_SIZE);
     usb_tx_inflight = 0U;
   }
 }
 
-/**
- * @brief USB 中斷連線或 CDC class deinit 時清空所有待傳回覆與 inflight 狀態。
- * @retval 無。
- * @note RX queue 由 CDC 重新連線後的資料自然重建，此函式只處理 TX lifecycle。
- */
-void USB_Command_OnDisconnect(void) {
-  /* 斷線後舊回覆沒有收件者，全部捨棄；重新連線從乾淨 TX 狀態開始。 */
-  usb_tx_head = 0U;
-  usb_tx_tail = 0U;
-  usb_tx_inflight = 0U;
+/** @brief LPUART1 收完一個 byte 後放入 RX queue，並立刻重啟下一筆接收。 */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *uart) {
+  if (uart == command_uart) {
+    command_uart_rx_armed = 0U;
+    USB_Command_OnReceive(&command_uart_rx_byte, 1U);
+    if (HAL_UART_Receive_IT(command_uart, &command_uart_rx_byte, 1U) == HAL_OK) {
+      command_uart_rx_armed = 1U;
+    } else {
+      command_uart_error = 1U;
+    }
+  }
+}
+
+/** @brief LPUART1 完成一行回覆後釋放對應的 TX queue slot。 */
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *uart) {
+  if (uart == command_uart) {
+    USB_Command_OnTransmitComplete();
+  }
+}
+
+/** @brief UART 發生 framing、noise 或 overrun error 後回報並恢復接收。 */
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *uart) {
+  if (uart == command_uart) {
+    command_uart_rx_armed = 0U;
+    command_uart_error = 1U;
+    if (HAL_UART_Receive_IT(command_uart, &command_uart_rx_byte, 1U) == HAL_OK) {
+      command_uart_rx_armed = 1U;
+    }
+  }
 }

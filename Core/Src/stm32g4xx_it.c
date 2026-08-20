@@ -55,7 +55,7 @@
 /*
  * IRQ handler 維持最薄的一層：只把事件交給 HAL/BSP。
  * HAL callback 再將資料放入 queue 或更新旗標，複雜 state machine 留在主迴圈。
- * EMS EXTI priority 0 高於 FDCAN priority 1 與 USB priority 6。
+ * EMS EXTI priority 0 高於 FDCAN priority 1 與 LPUART1 priority 6。
  */
 
 /* USER CODE END 0 */
@@ -64,7 +64,7 @@
 /* FDCAN handle 定義於 main.c，供 IRQ handler 呼叫 HAL 使用。 */
 extern FDCAN_HandleTypeDef hfdcan2;
 extern FDCAN_HandleTypeDef hfdcan3;
-extern PCD_HandleTypeDef hpcd_USB_FS;
+extern UART_HandleTypeDef hcom_uart[];
 
 /* USER CODE BEGIN EV */
 
@@ -235,12 +235,11 @@ void FDCAN3_IT0_IRQHandler(void)
 }
 
 /**
-  * @brief 處理 USB Full-Speed low-priority interrupt
+  * @brief 處理 NUCLEO ST-LINK VCP 使用的 LPUART1 interrupt
   */
-void USB_LP_IRQHandler(void)
+void LPUART1_IRQHandler(void)
 {
-  /* PCD callback 會一路把 endpoint 事件交給 USB Device Core 與 CDC class。 */
-  HAL_PCD_IRQHandler(&hpcd_USB_FS);
+  HAL_UART_IRQHandler(&hcom_uart[COM1]);
 }
 
 /**

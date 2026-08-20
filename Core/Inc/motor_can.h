@@ -154,19 +154,24 @@ MotorCAN_Status MotorCAN_StartHome(uint8_t bus, uint16_t id,
                                    uint32_t timeout_ms);
 
 /**
-  * @brief 先同步 homing 所有 big motor，再依序 homing 所有 small motor。
+  * @brief 先依序 homing 所有 small motor，再依序 homing 所有 big motor。
   * @note 馬達清單取自 MachineState；成功前 TEST、HOME、ROTATE 都會被拒絕。
+  *       big motor 由 STM32 讀取 IN_1，自行執行高速搜尋、低速退出、低速定位，
+  *       各階段都以 Synchronization mark 帶動配對的 small motor。
   */
 MotorCAN_Status MotorCAN_StartInit(void);
 
 /**
-  * @brief 使用各自的 signed offset 角度執行 big/small motor 初始化。
-  * @note 負角度會先以 offset 0 homing；big offset 完成後才進入 small homing，
-  *       各組 rotate 完都會設為新零點。
+  * @brief 在預設值上追加各自的 signed offset 角度，再初始化 big/small motor。
+  * @param big_additional_offset_angle_degrees 追加到 big motor 預設值的角度。
+  * @param small_additional_offset_angle_degrees 追加到 small motor 預設值的角度。
+  * @note small motor 的最終負角度以 rotate 補償；big motor 的所有非零角度
+  *       都在 STM32 homing 後以 rotate 套用。small 完成後才進入 big motor。
   */
 MotorCAN_Status
-MotorCAN_StartInitWithOffsetAngles(double big_offset_angle_degrees,
-                                   double small_offset_angle_degrees);
+MotorCAN_StartInitWithOffsetAngles(
+    double big_additional_offset_angle_degrees,
+    double small_additional_offset_angle_degrees);
 
 /** @brief 回傳本次開機是否已完整執行 INIT。 */
 uint8_t MotorCAN_IsInitialized(void);
@@ -175,7 +180,7 @@ uint8_t MotorCAN_IsInitialized(void);
   * @brief 依 machine_state 規劃並同步啟動一組 Rubik 馬達動作。
   * @param bus face 尚未設定時使用的 1-based CAN bus。
   * @param id face 尚未設定時使用的主要馬達 ID。
-  * @param command R、R_、Rw、Rw_ 等 Rubik command。
+  * @param command INIT、R、R2、R_、Rw、Rw2、Rw_ 等 machine-state command。
   * @note 會使用 Servo42D 4AH Synchronization mark 與 broadcast 4BH 同步啟動。
   */
 MotorCAN_Status MotorCAN_StartRotate(uint8_t bus, uint16_t id,
