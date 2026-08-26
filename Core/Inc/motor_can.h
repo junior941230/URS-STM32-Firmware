@@ -178,13 +178,10 @@ uint8_t MotorCAN_IsInitialized(void);
 
 /**
   * @brief 依 machine_state 規劃並同步啟動一組 Rubik 馬達動作。
-  * @param bus face 尚未設定時使用的 1-based CAN bus。
-  * @param id face 尚未設定時使用的主要馬達 ID。
   * @param command INIT、R、R2、R_、Rw、Rw2、Rw_ 等 machine-state command。
   * @note 會使用 Servo42D 4AH Synchronization mark 與 broadcast 4BH 同步啟動。
   */
-MotorCAN_Status MotorCAN_StartRotate(uint8_t bus, uint16_t id,
-                                     const char *command);
+MotorCAN_Status MotorCAN_StartRotate(const char *command);
 
 /**
   * @brief 將指定 STM32 CAN bus 切換為 500 或 1000 kbit/s。

@@ -214,28 +214,38 @@ MachineState_PlanAddFaceMotion(MachineMotionPlan *plan, uint8_t stage_index,
 static MachinePlanStatus FaceModule_Macro(MachineMotionPlan *plan,
                                           uint8_t stage, MachineFace face,
                                           uint16_t big_rpm, uint8_t big_acc,
-                                          BigMotor_State big_state) {
+                                          int8_t angle_units) {
   FaceModule *module = MachineState_GetFaceModule(face);
   MachinePlanStatus status;
+  uint8_t small_acc;
+  uint16_t small_rpm;
+  double angle;
 
-  if ((plan == NULL) || (module == NULL) || (big_state > BIG_MOTOR_HORIZON)) {
+  if ((plan == NULL) || (module == NULL)) {
     return MACHINE_PLAN_INVALID_ARGUMENT;
   }
-  if (big_state == plan->pending_big_states[(uint8_t)face]) {
+  if (angle_units == 0) {
     return MACHINE_PLAN_OK;
   }
-  uint8_t small_acc = (uint8_t)(256U - (256U - big_acc) / 0.5);
-  uint16_t small_rpm = (uint16_t)(big_rpm * 0.5);
+
+  small_acc = (uint8_t)(256U - (256U - big_acc) / 0.5);
+  small_rpm = (uint16_t)(big_rpm * 0.5);
+  /* 一個 unit 是 90 度；big motor 維持既有的 2:1 動作比例。 */
+  angle = (double)angle_units * 90.0;
   status = MachineState_PlanAddFaceMotion(
-      plan, stage, face, MACHINE_MOTOR_SMALL, small_rpm, small_acc, 90.0);
+      plan, stage, face, MACHINE_MOTOR_SMALL, small_rpm, small_acc, angle);
   if (status != MACHINE_PLAN_OK) {
     return status;
   }
 
   status = MachineState_PlanAddFaceMotion(plan, stage, face, MACHINE_MOTOR_BIG,
-                                          big_rpm, big_acc, 180.0);
-  if (status == MACHINE_PLAN_OK) {
-    plan->pending_big_states[(uint8_t)face] = big_state;
+                                          big_rpm, big_acc, angle * 2.0);
+  /* 奇數個 90 度 unit 會切換垂直/水平；偶數個 unit 回到相同姿態。 */
+  if ((status == MACHINE_PLAN_OK) && ((angle_units % 2) != 0)) {
+    plan->pending_big_states[(uint8_t)face] =
+        (plan->pending_big_states[(uint8_t)face] == BIG_MOTOR_VERTICAL)
+            ? BIG_MOTOR_HORIZON
+            : BIG_MOTOR_VERTICAL;
     plan->pending_big_state_mask |= (uint8_t)(1U << (uint8_t)face);
   }
   return status;
@@ -267,129 +277,56 @@ MachinePlanStatus MachineState_PlanGrip(MachineMotionPlan *plan, uint8_t stage,
   return status;
 }
 
-#if 0
 static MachinePlanStatus
 MachineState_AddPreparationStages(Rotate_Command_Type command,
                                   MachineMotionPlan *plan) {
-  const Rotate_Command_Type Last_command = machine_state.Last_command;
-
-  /* 各 command case 可直接使用這兩個變數，不需要增加 R2/L2/... case。 */
-  (void)Last_command;
-  /*
-   * 在這裡編排「目標 face 轉動前」的準備 stage。
-   * 同一個 stage 內可加入多顆馬達，它們會用 4AH/4BH 同步啟動。
-   * 再呼叫一次 MachineState_PlanAddStage() 就是下一組，前一組完成才執行。
-   *
-   * R 的兩組準備動作範例（先用 MachineState_ConfigureFace() 設定 ID）：
-   *   uint8_t stage;
-   *   MachinePlanStatus status;
-   *   status = MachineState_PlanAddStage(plan, &stage);       // 第 1 組
-   *   if (status != MACHINE_PLAN_OK) return status;
-   *   status = MachineState_PlanAddFaceMotion(
-   *     plan, stage, MACHINE_FACE_LEFT, MACHINE_MOTOR_SMALL,
-   *     200U, 2U, 20.0);
-   *   if (status != MACHINE_PLAN_OK) return status;
-   *   status = MachineState_PlanAddFaceMotion(
-   *     plan, stage, MACHINE_FACE_UP, MACHINE_MOTOR_SMALL,
-   *     200U, 2U, -20.0);                                    // 與 LEFT
-   * 同步反向 if (status != MACHINE_PLAN_OK) return status; status =
-   * MachineState_PlanAddStage(plan, &stage);       // 第 2 組 if (status !=
-   * MACHINE_PLAN_OK) return status; return MachineState_PlanAddFaceMotion(
-   *     plan, stage, MACHINE_FACE_FRONT, MACHINE_MOTOR_SMALL,
-   *     200U, 2U, 20.0);
-   * 最後會自動執行第 3 組：RIGHT big motor。
-   */
-  uint8_t stage;
-  MachinePlanStatus status;
-  if (Last_command == ROTATE_COMMAND_INIT) {
-    status = MachineState_PlanAddStage(plan, &stage);
-    if (status != MACHINE_PLAN_OK) {
-      return status;
-    }
-    status =
-        FaceModule_Macro(plan, stage, MACHINE_FACE_FRONT, MAX_RPM, 255U, 90.0);
-    if (status != MACHINE_PLAN_OK) {
-      return status;
-    }
-    status =
-        FaceModule_Macro(plan, stage, MACHINE_FACE_BACK, MAX_RPM, 255U, 90.0);
-    if (status != MACHINE_PLAN_OK) {
-      return status;
-    }
-  }
-
-  switch (command) {
-  case ROTATE_COMMAND_INIT: // 初始化動作
-    status = MachineState_PlanAddStage(plan, &stage);
-    if (status != MACHINE_PLAN_OK) {
-      return status;
-    }
-
-    status = MachineState_PlanAddFaceMotion(plan, stage, MACHINE_FACE_LEFT,
-                                            MACHINE_MOTOR_SMALL, MAX_RPM, 255U,
-                                            90.0);
-    if (status != MACHINE_PLAN_OK) {
-      return status;
-    }
-    status = MachineState_PlanAddFaceMotion(plan, stage, MACHINE_FACE_RIGHT,
-                                            MACHINE_MOTOR_SMALL, MAX_RPM, 255U,
-                                            90.0);
-    if (status != MACHINE_PLAN_OK) {
-      return status;
-    }
-    status = MachineState_PlanAddStage(plan, &stage);
-    if (status != MACHINE_PLAN_OK) {
-      return status;
-    }
-    return MachineState_PlanAddFaceMotion(plan, stage, MACHINE_FACE_DOWN,
-                                          MACHINE_MOTOR_SMALL, MAX_RPM, 255U,
-                                          90.0);
-
-  case ROTATE_COMMAND_R: // 初始化動作
-    status = MachineState_PlanAddStage(plan, &stage);
-    if (status != MACHINE_PLAN_OK) {
-      return status;
-    }
-    return FaceModule_Macro(plan, stage, MACHINE_FACE_RIGHT, MAX_RPM, 255U,
-                            360.0 * (double)command_multiplier);
-  case ROTATE_COMMAND_R_PRIME:
-  case ROTATE_COMMAND_L:
-  case ROTATE_COMMAND_L_PRIME:
-  case ROTATE_COMMAND_U:
-  case ROTATE_COMMAND_U_PRIME:
-  case ROTATE_COMMAND_D:
-  case ROTATE_COMMAND_D_PRIME:
-
-  case ROTATE_COMMAND_F:
-  case ROTATE_COMMAND_F_PRIME:
-  case ROTATE_COMMAND_B:
-  case ROTATE_COMMAND_B_PRIME:
-  case ROTATE_COMMAND_RW:
-  case ROTATE_COMMAND_RW_PRIME:
-  case ROTATE_COMMAND_LW:
-  case ROTATE_COMMAND_LW_PRIME:
-  case ROTATE_COMMAND_UW:
-  case ROTATE_COMMAND_UW_PRIME:
-  case ROTATE_COMMAND_DW:
-  case ROTATE_COMMAND_DW_PRIME:
-  case ROTATE_COMMAND_FW:
-  case ROTATE_COMMAND_FW_PRIME:
-  case ROTATE_COMMAND_BW:
-  case ROTATE_COMMAND_BW_PRIME:
-    return MACHINE_PLAN_OK;
-  default:
-    (void)plan;
-    return MACHINE_PLAN_INVALID_ARGUMENT;
-  }
-}
-
-#endif
-
-static MachinePlanStatus
-MachineState_AddPreparationStages(Rotate_Command_Type command,
-                                  MachineMotionPlan *plan) {
-  const Rotate_Command_Type Last_command = machine_state.Last_command;
+  Rotate_Command_Type action_command = command;
   uint8_t current_stage = 0U;
+  const int8_t command_units = MachineState_CommandIsPrime(command)
+                                   ? -(int8_t)plan->command_multiplier
+                                   : (int8_t)plan->command_multiplier;
+
+  /* Prime 使用相同準備動作，只反轉最後的旋轉方向。 */
+  switch (command) {
+  case ROTATE_COMMAND_R_PRIME:
+    action_command = ROTATE_COMMAND_R;
+    break;
+  case ROTATE_COMMAND_L_PRIME:
+    action_command = ROTATE_COMMAND_L;
+    break;
+  case ROTATE_COMMAND_U_PRIME:
+    action_command = ROTATE_COMMAND_U;
+    break;
+  case ROTATE_COMMAND_D_PRIME:
+    action_command = ROTATE_COMMAND_D;
+    break;
+  case ROTATE_COMMAND_F_PRIME:
+    action_command = ROTATE_COMMAND_F;
+    break;
+  case ROTATE_COMMAND_B_PRIME:
+    action_command = ROTATE_COMMAND_B;
+    break;
+  case ROTATE_COMMAND_RW_PRIME:
+    action_command = ROTATE_COMMAND_RW;
+    break;
+  case ROTATE_COMMAND_LW_PRIME:
+    action_command = ROTATE_COMMAND_LW;
+    break;
+  case ROTATE_COMMAND_UW_PRIME:
+    action_command = ROTATE_COMMAND_UW;
+    break;
+  case ROTATE_COMMAND_DW_PRIME:
+    action_command = ROTATE_COMMAND_DW;
+    break;
+  case ROTATE_COMMAND_FW_PRIME:
+    action_command = ROTATE_COMMAND_FW;
+    break;
+  case ROTATE_COMMAND_BW_PRIME:
+    action_command = ROTATE_COMMAND_BW;
+    break;
+  default:
+    break;
+  }
 
   /* 同一 stage 的 move 同步執行；nextStage 後等待上一組完成再執行。 */
 #define nextStage()                                                            \
@@ -400,10 +337,10 @@ MachineState_AddPreparationStages(Rotate_Command_Type command,
       return add_stage_status;                                                 \
     }                                                                          \
   } while (0)
-#define move(face, rpm, acc, state)                                            \
+#define move(face, rpm, acc, units)                                            \
   do {                                                                         \
     MachinePlanStatus move_status =                                            \
-        FaceModule_Macro(plan, current_stage, (face), (rpm), (acc), (state));  \
+        FaceModule_Macro(plan, current_stage, (face), (rpm), (acc), (units));  \
     if (move_status != MACHINE_PLAN_OK) {                                      \
       return move_status;                                                      \
     }                                                                          \
@@ -417,52 +354,158 @@ MachineState_AddPreparationStages(Rotate_Command_Type command,
     }                                                                          \
   } while (0)
 
-  /* 自訂義開始*/
-  // if (Last_command == ROTATE_COMMAND_INIT) {
-  //   nextStage();
-  //   move(MACHINE_FACE_FRONT, MAX_RPM, 255U, BIG_MOTOR_HORIZON);
-  //   move(MACHINE_FACE_BACK, MAX_RPM, 255U, BIG_MOTOR_HORIZON);
-  // }
-
-  switch (command) {
+  /* 自訂義開始 */
+  switch (action_command) {
   case ROTATE_COMMAND_INIT:
     nextStage();
-    move(MACHINE_FACE_LEFT, MAX_RPM, 255U, BIG_MOTOR_VERTICAL);
-    move(MACHINE_FACE_RIGHT, MAX_RPM, 255U, BIG_MOTOR_VERTICAL);
-    move(MACHINE_FACE_DOWN, MAX_RPM, 255U, BIG_MOTOR_VERTICAL);
+    if (plan->pending_big_states[MACHINE_FACE_LEFT] != BIG_MOTOR_VERTICAL) {
+      move(MACHINE_FACE_LEFT, MAX_RPM, 255U, -1);
+    }
+    if (plan->pending_big_states[MACHINE_FACE_RIGHT] != BIG_MOTOR_VERTICAL) {
+      move(MACHINE_FACE_RIGHT, MAX_RPM, 255U, -1);
+    }
+    if (plan->pending_big_states[MACHINE_FACE_DOWN] != BIG_MOTOR_VERTICAL) {
+      move(MACHINE_FACE_DOWN, MAX_RPM, 255U, -1);
+    }
     nextStage();
     grip(MACHINE_FACE_LEFT, MAX_RPM, 255U, MOTOR_ANGLE_SHORT_SIDE);
     grip(MACHINE_FACE_RIGHT, MAX_RPM, 255U, MOTOR_ANGLE_SHORT_SIDE);
     grip(MACHINE_FACE_DOWN, MAX_RPM, 255U, MOTOR_ANGLE_SHORT_SIDE);
     break;
+
   case ROTATE_COMMAND_R:
     nextStage();
-    move(MACHINE_FACE_RIGHT, MAX_RPM, 255U, BIG_MOTOR_HORIZON);
+    grip(MACHINE_FACE_UP, MAX_RPM, 255U, MOTOR_ANGLE_NONE_SIDE);
+    /* 讓跟下面不衝突的另外兩側準備固定方塊。 */
+    if (plan->pending_small_states[MACHINE_FACE_DOWN] !=
+        MOTOR_ANGLE_NONE_SIDE) {
+      if (plan->pending_big_states[MACHINE_FACE_DOWN] == BIG_MOTOR_VERTICAL) {
+        if (plan->pending_big_states[MACHINE_FACE_FRONT] != BIG_MOTOR_HORIZON) {
+          grip(MACHINE_FACE_FRONT, MAX_RPM, 255U, MOTOR_ANGLE_NONE_SIDE);
+          move(MACHINE_FACE_FRONT, MAX_RPM, 255U, -1);
+        }
+        if (plan->pending_big_states[MACHINE_FACE_BACK] != BIG_MOTOR_HORIZON) {
+          grip(MACHINE_FACE_BACK, MAX_RPM, 255U, MOTOR_ANGLE_NONE_SIDE);h
+          move(MACHINE_FACE_BACK, MAX_RPM, 255U, -1);
+        }
+        nextStage();
+        grip(MACHINE_FACE_FRONT, MAX_RPM, 255U, MOTOR_ANGLE_SHORT_SIDE);
+        grip(MACHINE_FACE_BACK, MAX_RPM, 255U, MOTOR_ANGLE_SHORT_SIDE);
+        nextStage();
+        grip(MACHINE_FACE_DOWN, MAX_RPM, 255U, MOTOR_ANGLE_NONE_SIDE);
+      } else {
+        if (plan->pending_big_states[MACHINE_FACE_LEFT] != BIG_MOTOR_HORIZON) {
+          grip(MACHINE_FACE_LEFT, MAX_RPM, 255U, MOTOR_ANGLE_NONE_SIDE);
+          move(MACHINE_FACE_LEFT, MAX_RPM, 255U, -1);
+        }
+        if (plan->pending_big_states[MACHINE_FACE_RIGHT] != BIG_MOTOR_HORIZON) {
+          grip(MACHINE_FACE_RIGHT, MAX_RPM, 255U, MOTOR_ANGLE_NONE_SIDE);
+          move(MACHINE_FACE_RIGHT, MAX_RPM, 255U, -1);
+        }
+        nextStage();
+        grip(MACHINE_FACE_FRONT, MAX_RPM, 255U, MOTOR_ANGLE_SHORT_SIDE);
+        grip(MACHINE_FACE_BACK, MAX_RPM, 255U, MOTOR_ANGLE_SHORT_SIDE);
+        nextStage();
+        grip(MACHINE_FACE_DOWN, MAX_RPM, 255U, MOTOR_ANGLE_NONE_SIDE);
+      }
+    }
+    nextStage();
+    move(MACHINE_FACE_RIGHT, MAX_RPM, 255U, command_units);
     break;
-  case ROTATE_COMMAND_R_PRIME:
+
   case ROTATE_COMMAND_L:
-  case ROTATE_COMMAND_L_PRIME:
-  case ROTATE_COMMAND_U:
-  case ROTATE_COMMAND_U_PRIME:
-  case ROTATE_COMMAND_D:
-  case ROTATE_COMMAND_D_PRIME:
-  case ROTATE_COMMAND_F:
-  case ROTATE_COMMAND_F_PRIME:
-  case ROTATE_COMMAND_B:
-  case ROTATE_COMMAND_B_PRIME:
-  case ROTATE_COMMAND_RW:
-  case ROTATE_COMMAND_RW_PRIME:
-  case ROTATE_COMMAND_LW:
-  case ROTATE_COMMAND_LW_PRIME:
-  case ROTATE_COMMAND_UW:
-  case ROTATE_COMMAND_UW_PRIME:
-  case ROTATE_COMMAND_DW:
-  case ROTATE_COMMAND_DW_PRIME:
-  case ROTATE_COMMAND_FW:
-  case ROTATE_COMMAND_FW_PRIME:
-  case ROTATE_COMMAND_BW:
-  case ROTATE_COMMAND_BW_PRIME:
+    nextStage();
+    grip(MACHINE_FACE_UP, MAX_RPM, 255U, MOTOR_ANGLE_NONE_SIDE);
+    /* 讓跟下面不衝突的另外兩側準備固定方塊。 */
+    if (plan->pending_small_states[MACHINE_FACE_DOWN] !=
+        MOTOR_ANGLE_NONE_SIDE) {
+      if (plan->pending_big_states[MACHINE_FACE_DOWN] == BIG_MOTOR_VERTICAL) {
+        if (plan->pending_big_states[MACHINE_FACE_FRONT] != BIG_MOTOR_HORIZON) {
+          grip(MACHINE_FACE_FRONT, MAX_RPM, 255U, MOTOR_ANGLE_NONE_SIDE);
+          move(MACHINE_FACE_FRONT, MAX_RPM, 255U, -1);
+        }
+        if (plan->pending_big_states[MACHINE_FACE_BACK] != BIG_MOTOR_HORIZON) {
+          grip(MACHINE_FACE_BACK, MAX_RPM, 255U, MOTOR_ANGLE_NONE_SIDE);
+          move(MACHINE_FACE_BACK, MAX_RPM, 255U, -1);
+        }
+        nextStage();
+        grip(MACHINE_FACE_FRONT, MAX_RPM, 255U, MOTOR_ANGLE_SHORT_SIDE);
+        grip(MACHINE_FACE_BACK, MAX_RPM, 255U, MOTOR_ANGLE_SHORT_SIDE);
+        nextStage();
+        grip(MACHINE_FACE_DOWN, MAX_RPM, 255U, MOTOR_ANGLE_NONE_SIDE);
+      } else {
+        if (plan->pending_big_states[MACHINE_FACE_LEFT] != BIG_MOTOR_HORIZON) {
+          grip(MACHINE_FACE_LEFT, MAX_RPM, 255U, MOTOR_ANGLE_NONE_SIDE);
+          move(MACHINE_FACE_LEFT, MAX_RPM, 255U, -1);
+        }
+        if (plan->pending_big_states[MACHINE_FACE_RIGHT] != BIG_MOTOR_HORIZON) {
+          grip(MACHINE_FACE_RIGHT, MAX_RPM, 255U, MOTOR_ANGLE_NONE_SIDE);
+          move(MACHINE_FACE_RIGHT, MAX_RPM, 255U, -1);
+        }
+        nextStage();
+        grip(MACHINE_FACE_FRONT, MAX_RPM, 255U, MOTOR_ANGLE_SHORT_SIDE);
+        grip(MACHINE_FACE_BACK, MAX_RPM, 255U, MOTOR_ANGLE_SHORT_SIDE);
+        nextStage();
+        grip(MACHINE_FACE_DOWN, MAX_RPM, 255U, MOTOR_ANGLE_NONE_SIDE);
+      }
+    }
+    nextStage();
+    move(MACHINE_FACE_LEFT, MAX_RPM, 255U, command_units);
     break;
+
+  case ROTATE_COMMAND_U:
+  case ROTATE_COMMAND_D:
+  case ROTATE_COMMAND_F:
+    nextStage();
+    grip(MACHINE_FACE_UP, MAX_RPM, 255U, MOTOR_ANGLE_NONE_SIDE);
+    /* 讓跟下面不衝突的另外兩側準備固定方塊。 */
+    if (plan->pending_small_states[MACHINE_FACE_DOWN] !=
+        MOTOR_ANGLE_NONE_SIDE) {
+      if (plan->pending_big_states[MACHINE_FACE_DOWN] == BIG_MOTOR_VERTICAL) {
+        if (plan->pending_big_states[MACHINE_FACE_FRONT] != BIG_MOTOR_HORIZON) {
+          grip(MACHINE_FACE_FRONT, MAX_RPM, 255U, MOTOR_ANGLE_NONE_SIDE);
+          move(MACHINE_FACE_FRONT, MAX_RPM, 255U, -1);
+        }
+        if (plan->pending_big_states[MACHINE_FACE_BACK] != BIG_MOTOR_HORIZON) {
+          grip(MACHINE_FACE_BACK, MAX_RPM, 255U, MOTOR_ANGLE_NONE_SIDE);
+          move(MACHINE_FACE_BACK, MAX_RPM, 255U, -1);
+        }
+        nextStage();
+        grip(MACHINE_FACE_FRONT, MAX_RPM, 255U, MOTOR_ANGLE_SHORT_SIDE);
+        grip(MACHINE_FACE_BACK, MAX_RPM, 255U, MOTOR_ANGLE_SHORT_SIDE);
+        nextStage();
+        grip(MACHINE_FACE_DOWN, MAX_RPM, 255U, MOTOR_ANGLE_NONE_SIDE);
+      } else {
+        if (plan->pending_big_states[MACHINE_FACE_LEFT] != BIG_MOTOR_HORIZON) {
+          grip(MACHINE_FACE_LEFT, MAX_RPM, 255U, MOTOR_ANGLE_NONE_SIDE);
+          move(MACHINE_FACE_LEFT, MAX_RPM, 255U, -1);
+        }
+        if (plan->pending_big_states[MACHINE_FACE_RIGHT] != BIG_MOTOR_HORIZON) {
+          grip(MACHINE_FACE_RIGHT, MAX_RPM, 255U, MOTOR_ANGLE_NONE_SIDE);
+          move(MACHINE_FACE_RIGHT, MAX_RPM, 255U, -1);
+        }
+        nextStage();
+        grip(MACHINE_FACE_FRONT, MAX_RPM, 255U, MOTOR_ANGLE_SHORT_SIDE);
+        grip(MACHINE_FACE_BACK, MAX_RPM, 255U, MOTOR_ANGLE_SHORT_SIDE);
+        nextStage();
+        grip(MACHINE_FACE_DOWN, MAX_RPM, 255U, MOTOR_ANGLE_NONE_SIDE);
+      }
+    }
+    nextStage();
+    grip(MACHINE_FACE_LEFT, MAX_RPM, 255U, MOTOR_ANGLE_NONE_SIDE);
+    grip(MACHINE_FACE_RIGHT, MAX_RPM, 255U, MOTOR_ANGLE_NONE_SIDE);
+    move(MACHINE_FACE_FRONT, MAX_RPM, 255U, command_units);
+    break;
+
+  case ROTATE_COMMAND_B:
+  case ROTATE_COMMAND_RW:
+  case ROTATE_COMMAND_LW:
+  case ROTATE_COMMAND_UW:
+  case ROTATE_COMMAND_DW:
+  case ROTATE_COMMAND_FW:
+  case ROTATE_COMMAND_BW:
+    break;
+
   default:
 #undef move
 #undef grip
@@ -508,8 +551,8 @@ void MachineState_Init(void) {
    */
   MachineState_ConfigureFace(MACHINE_FACE_FRONT, 1U, 12U, 13U, 1U);
   MachineState_ConfigureFace(MACHINE_FACE_BACK, 2U, 10U, 11U, 1U);
-  MachineState_ConfigureFace(MACHINE_FACE_RIGHT, 1U, 8U, 9U, 1U);
-  MachineState_ConfigureFace(MACHINE_FACE_LEFT, 2U, 4U, 5U, 1U);
+  MachineState_ConfigureFace(MACHINE_FACE_LEFT, 1U, 8U, 9U, 1U);
+  MachineState_ConfigureFace(MACHINE_FACE_RIGHT, 2U, 4U, 5U, 1U);
   MachineState_ConfigureFace(MACHINE_FACE_UP, 1U, 2U, 3U, 1U);
   MachineState_ConfigureFace(MACHINE_FACE_DOWN, 2U, 6U, 7U, 1U);
 }
@@ -530,19 +573,15 @@ void MachineState_ConfigureFace(MachineFace face, uint8_t bus,
   module->clockwise_axis_positive = clockwise_axis_positive;
 }
 
-MachinePlanStatus MachineState_BuildRotatePlan(uint8_t fallback_bus,
-                                               uint16_t fallback_id,
-                                               const char *command_text,
+MachinePlanStatus MachineState_BuildRotatePlan(const char *command_text,
                                                MachineMotionPlan *plan) {
   Rotate_Command_Type command;
   uint8_t command_multiplier;
   FaceModule *module;
   MachinePlanStatus status;
 
-  if ((plan == NULL) || (fallback_bus < 1U) || (fallback_bus > 2U) ||
-      (fallback_id < 1U) || (fallback_id > 0x7FFU) ||
-      (!MachineState_ParseCommand(command_text, &command,
-                                  &command_multiplier))) {
+  if ((plan == NULL) || (!MachineState_ParseCommand(command_text, &command,
+                                                    &command_multiplier))) {
     return MACHINE_PLAN_INVALID_ARGUMENT;
   }
 

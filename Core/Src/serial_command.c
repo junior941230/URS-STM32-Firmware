@@ -370,8 +370,7 @@ static void USB_Command_ExecuteLine(char *line) {
     USB_Command_QueueText("TIMER <START|END>");
     USB_Command_QueueText("STATUS | PING | HELP");
     USB_Command_QueueText(
-        "ROTATE <bus> <id> "
-        "<INIT|R|R2|R_|L|L2|L_|U|U2|U_|D|D2|D_|F|F2|F_|B|B2|B_|"
+        "ROTATE <INIT|R|R2|R_|L|L2|L_|U|U2|U_|D|D2|D_|F|F2|F_|B|B2|B_|"
         "Rw|Rw2|Rw_|Lw|Lw2|Lw_|Uw|Uw2|Uw_|Dw|Dw2|Dw_|Fw|Fw2|Fw_|"
         "Bw|Bw2|Bw_> CONFIRM");
     return;
@@ -609,22 +608,17 @@ static void USB_Command_ExecuteLine(char *line) {
   }
 
   if (strcmp(command, "ROTATE") == 0) {
-    token_bus = strtok(NULL, " \t");
-    token_id = strtok(NULL, " \t");
     token_command = strtok(NULL, " \t");
     token_confirm = strtok(NULL, " \t");
 
-    if ((!USB_Command_ParseNumber(token_bus, 2U, &bus_value)) ||
-        (bus_value < 1U) ||
-        (!USB_Command_ParseNumber(token_id, 0x7FFU, &id_value)) ||
-        (id_value < 1U) || (token_command == NULL) || (token_confirm == NULL) ||
+    if ((token_command == NULL) || (token_confirm == NULL) ||
         (strcmp(token_confirm, "CONFIRM") != 0) ||
         USB_Command_HasExtraToken()) {
       USB_Command_QueueText("ERR ROTATE SYNTAX_OR_CONFIRM");
       return;
     }
 
-    status = MotorCAN_StartRotate((uint8_t)bus_value, id_value, token_command);
+    status = MotorCAN_StartRotate(token_command);
     USB_Command_ReportStartStatus(status, "ROTATE");
     return;
   }

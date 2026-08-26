@@ -32,10 +32,10 @@
 #define MOTOR_CAN_RESTART_DELAY_MS 1000U
 
 /* TEST 使用固定且保守的短行程參數，避免測試命令造成長時間移動。 */
-#define MOTOR_CAN_TEST_TIMEOUT_MS 2000U
-#define MOTOR_CAN_TEST_SPEED_RPM 30U
-#define MOTOR_CAN_TEST_ACCELERATION 2U
-#define MOTOR_CAN_TEST_RUNTIME_10MS 50U
+#define MOTOR_CAN_TEST_TIMEOUT_MS 6000U
+#define MOTOR_CAN_TEST_SPEED_RPM 30000U
+#define MOTOR_CAN_TEST_ACCELERATION 255U
+#define MOTOR_CAN_TEST_RUNTIME_10MS 5000U
 
 /* HOME 的 torque 固定為 300 mA；使用者可設定速度、offset 與 timeout。 */
 #define MOTOR_CAN_HOME_TORQUE_MA 300U
@@ -2524,8 +2524,8 @@ static void MotorCAN_HandleFrame(const MotorCAN_RxFrame *frame) {
 
       expected_active =
           (motor_context.init_home_phase == MOTOR_INIT_HOME_PHASE_RELEASE_SLOW)
-              ? 0U
-              : 1U;
+              ? (uint8_t)0U
+              : (uint8_t)1U;
       if (switch_active == expected_active) {
         if (motor_context.init_home_switch_stable_count <
             MOTOR_CAN_INIT_SWITCH_STABLE_SAMPLES) {
@@ -3213,13 +3213,10 @@ MotorCAN_Status MotorCAN_StartTest(uint8_t bus, uint16_t id) {
 
 /**
  * @brief 由 machine_state 建立多馬達 plan，使用 4AH/4BH 同步執行 F4H 角度動作。
- * @param bus face 尚未設定時使用的 1-based CAN bus。
- * @param id face 尚未設定時使用的主要馬達 ID。
  * @param command INIT、R、R2、R_、Rw、Rw2、Rw_ 等 machine-state command。
  * @return 立即啟動狀態；完成、EMS 中止或錯誤由 event queue 回報。
  */
-MotorCAN_Status MotorCAN_StartRotate(uint8_t bus, uint16_t id,
-                                     const char *command) {
+MotorCAN_Status MotorCAN_StartRotate(const char *command) {
   MachineMotionPlan *plan;
   const MachineMotionStage *stage;
   uint8_t stage_index;
@@ -3231,8 +3228,7 @@ MotorCAN_Status MotorCAN_StartRotate(uint8_t bus, uint16_t id,
   if (!motor_can_initialized) {
     return MOTOR_CAN_STATUS_INIT_REQUIRED;
   }
-  if ((!MotorCAN_IsValidBus(bus)) || (!MotorCAN_IsValidNodeId(id)) ||
-      (command == NULL)) {
+  if (command == NULL) {
     return MOTOR_CAN_STATUS_INVALID_ARGUMENT;
   }
   if (EMS_IsStopActive()) {
@@ -3245,7 +3241,7 @@ MotorCAN_Status MotorCAN_StartRotate(uint8_t bus, uint16_t id,
   /* Plan 最大約 1.5 KB，直接放在 static context，避免佔用 MCU call stack。 */
   MotorCAN_ResetOperation();
   plan = &motor_context.rotate_plan;
-  if (MachineState_BuildRotatePlan(bus, id, command, plan) != MACHINE_PLAN_OK) {
+  if (MachineState_BuildRotatePlan(command, plan) != MACHINE_PLAN_OK) {
     MotorCAN_ResetOperation();
     return MOTOR_CAN_STATUS_INVALID_ARGUMENT;
   }

@@ -147,14 +147,10 @@ void MachineState_ConfigureFace(MachineFace face, uint8_t bus,
 
 /**
  * @brief 解析 Rubik command，依目前 machine state 產生同步馬達動作清單。
- * @param fallback_bus face 尚未設定時使用的 bus。
- * @param fallback_id face 尚未設定時使用的主要馬達 ID。
  * @param command INIT、R、R2、R_、Rw、Rw2、Rw_ 等命令字串，不分大小寫。
  * @param plan 成功時接收完整動作清單。
  */
-MachinePlanStatus MachineState_BuildRotatePlan(uint8_t fallback_bus,
-                                               uint16_t fallback_id,
-                                               const char *command,
+MachinePlanStatus MachineState_BuildRotatePlan(const char *command,
                                                MachineMotionPlan *plan);
 
 /** @brief 同步動作完成後，把 command 與倍數套用到 machine state。 */

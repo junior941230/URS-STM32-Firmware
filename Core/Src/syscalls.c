@@ -41,7 +41,7 @@ char **environ = __env;
 
 
 /* Functions */
-void initialise_monitor_handles()
+void initialise_monitor_handles(void)
 {
 }
 
@@ -71,7 +71,7 @@ __attribute__((weak)) int _read(int file, char *ptr, int len)
 
   for (DataIdx = 0; DataIdx < len; DataIdx++)
   {
-    *ptr++ = __io_getchar();
+    *ptr++ = (char)__io_getchar();
   }
 
   return len;
@@ -142,7 +142,7 @@ int _unlink(char *name)
 clock_t _times(struct tms *buf)
 {
   (void)buf;
-  return -1;
+  return ~(clock_t)0;
 }
 
 int _stat(const char *file, struct stat *st)
