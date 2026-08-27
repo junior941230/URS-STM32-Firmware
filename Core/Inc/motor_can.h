@@ -5,6 +5,7 @@
 extern "C" {
 #endif
 
+#include "machine_state.h"
 #include "stm32g4xx_hal.h"
 
 /**
@@ -41,7 +42,8 @@ typedef enum
   MOTOR_CAN_STATUS_EMS_ACTIVE,
   MOTOR_CAN_STATUS_INIT_REQUIRED,
   MOTOR_CAN_STATUS_TX_FAILED,
-  MOTOR_CAN_STATUS_RECONFIG_FAILED
+  MOTOR_CAN_STATUS_RECONFIG_FAILED,
+  MOTOR_CAN_STATUS_QUEUE_FULL
 } MotorCAN_Status;
 
 /** @brief 非同步操作完成後，由 event queue 回報給 USB command 層的事件。 */
@@ -177,11 +179,19 @@ MotorCAN_StartInitWithOffsetAngles(
 uint8_t MotorCAN_IsInitialized(void);
 
 /**
-  * @brief 依 machine_state 規劃並同步啟動一組 Rubik 馬達動作。
-  * @param command INIT、R、R2、R_、Rw、Rw2、Rw_ 等 machine-state command。
-  * @note 會使用 Servo42D 4AH Synchronization mark 與 broadcast 4BH 同步啟動。
+  * @brief 將一筆 ROTATE 放入 FIFO；閒置時會立即啟動 queue 最前端。
+  * @param face R/L/F/B/D/U 對應的 machine face。
+  * @param role big 或 small motor。
+  * @param angle_degrees signed double 相對角度。
+  * @param pending_count 成功時回傳尚未開始執行的 FIFO 筆數，可為 NULL。
+  * @note ROTATE 執行中仍可持續加入；EMS、INIT 失敗或 ROTATE 失敗會清空 FIFO。
   */
-MotorCAN_Status MotorCAN_StartRotate(const char *command);
+MotorCAN_Status MotorCAN_QueueRotate(MachineFace face, MachineMotorRole role,
+                                     double angle_degrees,
+                                     uint8_t *pending_count);
+
+/** @brief 取得尚未開始執行的 ROTATE FIFO 筆數。 */
+uint8_t MotorCAN_GetRotateQueueDepth(void);
 
 /**
   * @brief 將指定 STM32 CAN bus 切換為 500 或 1000 kbit/s。

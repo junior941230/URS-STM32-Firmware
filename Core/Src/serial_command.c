@@ -179,6 +179,8 @@ static const char *USB_Command_StatusName(MotorCAN_Status status) {
     return "CAN_TX_FAILED";
   case MOTOR_CAN_STATUS_RECONFIG_FAILED:
     return "CAN_RECONFIG_FAILED";
+  case MOTOR_CAN_STATUS_QUEUE_FULL:
+    return "QUEUE_FULL";
   default:
     return "UNKNOWN";
   }
@@ -270,6 +272,52 @@ static uint8_t USB_Command_ParseDouble(const char *text, double *value) {
   return 1U;
 }
 
+/** @brief 將 ROTATE 的單字母 face token 轉成 machine face。 */
+static uint8_t USB_Command_ParseFace(const char *text, MachineFace *face) {
+  if ((text == NULL) || (face == NULL) || (text[1] != '\0')) {
+    return 0U;
+  }
+  switch (text[0]) {
+  case 'R':
+    *face = MACHINE_FACE_RIGHT;
+    return 1U;
+  case 'L':
+    *face = MACHINE_FACE_LEFT;
+    return 1U;
+  case 'F':
+    *face = MACHINE_FACE_FRONT;
+    return 1U;
+  case 'B':
+    *face = MACHINE_FACE_BACK;
+    return 1U;
+  case 'D':
+    *face = MACHINE_FACE_DOWN;
+    return 1U;
+  case 'U':
+    *face = MACHINE_FACE_UP;
+    return 1U;
+  default:
+    return 0U;
+  }
+}
+
+/** @brief 將 BIG/SMALL token 轉成 machine motor role。 */
+static uint8_t USB_Command_ParseMotorRole(const char *text,
+                                          MachineMotorRole *role) {
+  if ((text == NULL) || (role == NULL)) {
+    return 0U;
+  }
+  if (strcmp(text, "BIG") == 0) {
+    *role = MACHINE_MOTOR_BIG;
+    return 1U;
+  }
+  if (strcmp(text, "SMALL") == 0) {
+    *role = MACHINE_MOTOR_SMALL;
+    return 1U;
+  }
+  return 0U;
+}
+
 /**
  * @brief 將 MotorCAN_Start*() 的立即結果排成 STARTED 或 ERR 回覆。
  * @param status Motor CAN 啟動狀態。
@@ -316,6 +364,9 @@ static void USB_Command_ExecuteLine(char *line) {
   char *token_timeout;
   char *token_confirm;
   char *token_command;
+  char *token_face;
+  char *token_motor_role;
+  char *token_angle;
   char *token_big_additional_offset;
   char *token_small_additional_offset;
   uint16_t bus_value;
@@ -326,11 +377,15 @@ static void USB_Command_ExecuteLine(char *line) {
   uint16_t low_speed_value;
   uint8_t direction_value;
   double offset_value;
+  double angle_value;
   double big_additional_offset_value;
   double small_additional_offset_value;
   uint32_t timeout_value;
   uint32_t elapsed_ms;
+  MachineFace face_value;
+  MachineMotorRole motor_role_value;
   MotorCAN_Status status;
+  uint8_t pending_count;
   size_t index;
 
   /*
@@ -370,9 +425,7 @@ static void USB_Command_ExecuteLine(char *line) {
     USB_Command_QueueText("TIMER <START|END>");
     USB_Command_QueueText("STATUS | PING | HELP");
     USB_Command_QueueText(
-        "ROTATE <INIT|R|R2|R_|L|L2|L_|U|U2|U_|D|D2|D_|F|F2|F_|B|B2|B_|"
-        "Rw|Rw2|Rw_|Lw|Lw2|Lw_|Uw|Uw2|Uw_|Dw|Dw2|Dw_|Fw|Fw2|Fw_|"
-        "Bw|Bw2|Bw_> CONFIRM");
+        "ROTATE <R|L|F|B|D|U> <BIG|SMALL> <angle_deg> CONFIRM");
     return;
   }
 
@@ -382,10 +435,12 @@ static void USB_Command_ExecuteLine(char *line) {
       return;
     }
     USB_Command_QueueText("OK STATUS ems=%s initialized=%u operation=%s "
-                          "can1=%uK can2=%uK ems_resume_without_reset=1",
+                          "rotate_pending=%u can1=%uK can2=%uK "
+                          "ems_resume_without_reset=1",
                           EMS_IsStopActive() ? "ACTIVE" : "OK",
                           MotorCAN_IsInitialized(),
                           USB_Command_OperationName(MotorCAN_GetOperation()),
+                          MotorCAN_GetRotateQueueDepth(),
                           MotorCAN_GetBusBitrate(1U),
                           MotorCAN_GetBusBitrate(2U));
     return;
@@ -608,18 +663,28 @@ static void USB_Command_ExecuteLine(char *line) {
   }
 
   if (strcmp(command, "ROTATE") == 0) {
-    token_command = strtok(NULL, " \t");
+    token_face = strtok(NULL, " \t");
+    token_motor_role = strtok(NULL, " \t");
+    token_angle = strtok(NULL, " \t");
     token_confirm = strtok(NULL, " \t");
 
-    if ((token_command == NULL) || (token_confirm == NULL) ||
+    if ((!USB_Command_ParseFace(token_face, &face_value)) ||
+        (!USB_Command_ParseMotorRole(token_motor_role, &motor_role_value)) ||
+        (!USB_Command_ParseDouble(token_angle, &angle_value)) ||
+        (token_confirm == NULL) ||
         (strcmp(token_confirm, "CONFIRM") != 0) ||
         USB_Command_HasExtraToken()) {
       USB_Command_QueueText("ERR ROTATE SYNTAX_OR_CONFIRM");
       return;
     }
 
-    status = MotorCAN_StartRotate(token_command);
-    USB_Command_ReportStartStatus(status, "ROTATE");
+    status = MotorCAN_QueueRotate(face_value, motor_role_value, angle_value,
+                                  &pending_count);
+    if (status == MOTOR_CAN_STATUS_OK) {
+      USB_Command_QueueText("OK ROTATE ACCEPTED pending=%u", pending_count);
+    } else {
+      USB_Command_QueueText("ERR ROTATE %s", USB_Command_StatusName(status));
+    }
     return;
   }
 
@@ -737,7 +802,7 @@ static void USB_Command_ProcessMotorEvents(void) {
     case MOTOR_CAN_EVENT_INIT_FINISHED:
       USB_Command_QueueText(
           "OK INIT big=6 sequential=1 small=6 sequential=1 "
-          "order=small_then_big complete");
+          "order=small_then_big ready_pose=1 complete");
       break;
 
     case MOTOR_CAN_EVENT_INIT_STOPPED_BY_EMS:
@@ -746,8 +811,9 @@ static void USB_Command_ProcessMotorEvents(void) {
       break;
 
     case MOTOR_CAN_EVENT_ROTATE_FINISHED:
-      USB_Command_QueueText("OK ROTATE bus=%u id=0x%03X synchronized=1 complete",
-                            event.bus, event.id);
+      USB_Command_QueueText(
+          "OK ROTATE bus=%u id=0x%03X synchronized=1 pending=%u complete",
+          event.bus, event.id, MotorCAN_GetRotateQueueDepth());
       break;
 
     case MOTOR_CAN_EVENT_ROTATE_STOPPED_BY_EMS:

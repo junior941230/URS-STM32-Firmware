@@ -23,6 +23,7 @@
 #define MOTOR_CAN_MAX_STANDARD_ID 0x7FFU
 #define MOTOR_CAN_RX_QUEUE_SIZE 16U
 #define MOTOR_CAN_EVENT_QUEUE_SIZE 8U
+#define MOTOR_CAN_ROTATE_COMMAND_QUEUE_SIZE 16U
 
 /* 各 state 等待馬達回覆的上限；所有 deadline 都以 HAL_GetTick() 的 ms 為單位。
  */
@@ -176,7 +177,8 @@ typedef enum {
   MOTOR_INIT_PHASE_CONFIG_SMALL,
   MOTOR_INIT_PHASE_HOME_SMALL,
   MOTOR_INIT_PHASE_POST_OFFSET_BIG,
-  MOTOR_INIT_PHASE_POST_OFFSET_SMALL
+  MOTOR_INIT_PHASE_POST_OFFSET_SMALL,
+  MOTOR_INIT_PHASE_READY_POSE
 } MotorCAN_InitPhase;
 
 typedef enum {
@@ -194,6 +196,12 @@ typedef struct {
   uint8_t direction;
   double offset_angle_degrees;
 } MotorCAN_InitTarget;
+
+typedef struct {
+  MachineFace face;
+  MachineMotorRole role;
+  double angle_degrees;
+} MotorCAN_RotateRequest;
 
 typedef struct {
   /* operation 是對外操作名稱；state 是該操作內部目前所處步驟。 */
@@ -283,6 +291,13 @@ static MotorCAN_Event motor_event_queue[MOTOR_CAN_EVENT_QUEUE_SIZE];
 static uint8_t motor_event_head;
 static uint8_t motor_event_tail;
 
+/* Waiting-only FIFO：目前正在執行的 ROTATE 已移入 motor_context，不計在內。 */
+static MotorCAN_RotateRequest
+    motor_rotate_command_queue[MOTOR_CAN_ROTATE_COMMAND_QUEUE_SIZE];
+static uint8_t motor_rotate_command_head;
+static uint8_t motor_rotate_command_tail;
+static uint8_t motor_rotate_command_count;
+
 static void MotorCAN_SendOrFail(uint8_t sent, MotorCAN_State next_state,
                                 uint32_t timeout_ms);
 static void MotorCAN_FailOperation(MotorCAN_Error error, uint8_t stop_motion);
@@ -292,6 +307,9 @@ static void MotorCAN_BeginInitHomeTarget(uint8_t target_index,
 static void MotorCAN_MarkInitBigComplete(uint8_t index);
 static void MotorCAN_BeginInitBigConfiguration(void);
 static uint8_t MotorCAN_IsInitHomeState(void);
+static void MotorCAN_BeginRotateStage(uint32_t now);
+static MotorCAN_Status MotorCAN_StartNextQueuedRotate(uint8_t report_failure);
+static void MotorCAN_ClearRotateCommandQueue(void);
 
 /**
  * @brief 驗證對外使用的 CAN bus 編號。
@@ -524,6 +542,38 @@ static void MotorCAN_ResetOperation(void) {
   memset(&motor_context, 0, sizeof(motor_context));
   motor_context.operation = MOTOR_CAN_OPERATION_NONE;
   motor_context.state = MOTOR_STATE_IDLE;
+}
+
+/** @brief 清空尚未開始執行的 ROTATE command FIFO。 */
+static void MotorCAN_ClearRotateCommandQueue(void) {
+  motor_rotate_command_head = 0U;
+  motor_rotate_command_tail = 0U;
+  motor_rotate_command_count = 0U;
+}
+
+/** @brief 將已驗證的 ROTATE request 加入 FIFO 尾端。 */
+static uint8_t
+MotorCAN_PushRotateCommand(const MotorCAN_RotateRequest *request) {
+  if ((request == NULL) ||
+      (motor_rotate_command_count >= MOTOR_CAN_ROTATE_COMMAND_QUEUE_SIZE)) {
+    return 0U;
+  }
+
+  motor_rotate_command_queue[motor_rotate_command_tail] = *request;
+  motor_rotate_command_tail = (uint8_t)((motor_rotate_command_tail + 1U) %
+                                        MOTOR_CAN_ROTATE_COMMAND_QUEUE_SIZE);
+  motor_rotate_command_count++;
+  return 1U;
+}
+
+/** @brief 移除 FIFO 最前端；呼叫端必須先確認 queue 非空。 */
+static void MotorCAN_PopRotateCommand(void) {
+  if (motor_rotate_command_count == 0U) {
+    return;
+  }
+  motor_rotate_command_head = (uint8_t)((motor_rotate_command_head + 1U) %
+                                        MOTOR_CAN_ROTATE_COMMAND_QUEUE_SIZE);
+  motor_rotate_command_count--;
 }
 
 /**
@@ -1194,15 +1244,48 @@ static void MotorCAN_CompleteHome(void) {
   MotorCAN_ResetOperation();
 }
 
-/** @brief 全部 small/big motor homing 完成後解鎖一般運動指令。 */
+/** @brief INIT homing 與 ready pose 都完成後解鎖一般運動指令。 */
 static void MotorCAN_CompleteInit(void) {
   MotorCAN_Event event = {0};
 
-  MachineState_CommitInitHoming();
   motor_can_initialized = 1U;
   event.type = MOTOR_CAN_EVENT_INIT_FINISHED;
   MotorCAN_PushEvent(&event);
   MotorCAN_ResetOperation();
+  (void)MotorCAN_StartNextQueuedRotate(1U);
+}
+
+/** @brief homing 完成後自動執行舊 ROTATE INIT 的 L/R/D small +90 ready pose。 */
+static void MotorCAN_BeginInitReadyPose(void) {
+  const MachineMotionStage *stage;
+  uint8_t index;
+
+  if (MachineState_BuildInitReadyPlan(&motor_context.rotate_plan) !=
+          MACHINE_PLAN_OK ||
+      (motor_context.rotate_plan.stage_count == 0U)) {
+    MotorCAN_FailOperation(MOTOR_CAN_ERROR_DEVICE_REJECTED, 1U);
+    return;
+  }
+
+  stage = &motor_context.rotate_plan.stages[0];
+  if (stage->motion_count == 0U) {
+    MotorCAN_FailOperation(MOTOR_CAN_ERROR_DEVICE_REJECTED, 1U);
+    return;
+  }
+  for (index = 0U; index < stage->motion_count; index++) {
+    const MachineMotorMotion *motion = &stage->motions[index];
+    if ((!MotorCAN_IsValidBus(motion->bus)) ||
+        (!motor_bus_online[motion->bus - 1U]) ||
+        (!MotorCAN_IsValidNodeId(motion->id))) {
+      MotorCAN_FailOperation(MOTOR_CAN_ERROR_DEVICE_REJECTED, 1U);
+      return;
+    }
+  }
+
+  motor_context.init_phase = MOTOR_INIT_PHASE_READY_POSE;
+  motor_context.rotate_stage_index = 0U;
+  motor_context.id = stage->motions[0].id;
+  MotorCAN_BeginRotateStage(HAL_GetTick());
 }
 
 /** @brief 回報一顆 big motor 的 homing 與 offset 都已完成。 */
@@ -1224,16 +1307,16 @@ static void MotorCAN_ReportInitBigProgress(uint8_t index) {
   MotorCAN_PushEvent(&event);
 }
 
-/** @brief 完成同步 ROTATE，提交 machine state 並產生完成事件。 */
+/** @brief 完成同步 ROTATE，產生事件並立即啟動 FIFO 下一筆。 */
 static void MotorCAN_CompleteRotate(void) {
   MotorCAN_Event event = {0};
 
-  MachineState_CommitRotate(&motor_context.rotate_plan);
   event.type = MOTOR_CAN_EVENT_ROTATE_FINISHED;
   event.bus = motor_context.bus;
   event.id = motor_context.id;
   MotorCAN_PushEvent(&event);
   MotorCAN_ResetOperation();
+  (void)MotorCAN_StartNextQueuedRotate(1U);
 }
 
 /** @brief 將負 homing offset 轉成反方向的 F4H 補償角度。 */
@@ -1333,7 +1416,7 @@ static void MotorCAN_AdvanceAfterInitPostOffset(void) {
         motor_context.init_phase = MOTOR_INIT_PHASE_CONFIG_BIG;
         MotorCAN_BeginInitTarget(next_face);
       } else {
-        MotorCAN_CompleteInit();
+        MotorCAN_BeginInitReadyPose();
       }
     }
     break;
@@ -1368,6 +1451,109 @@ static void MotorCAN_BeginRotateStage(uint32_t now) {
   }
   motor_context.state = MOTOR_STATE_ROTATE_QUEUE_SYNC_ENABLE;
   motor_context.rotate_queue_deadline = now + MOTOR_CAN_ROTATE_QUEUE_TIMEOUT_MS;
+}
+
+/** @brief 將 FIFO 最前端 request 轉成 plan，並移入 active ROTATE context。 */
+static MotorCAN_Status
+MotorCAN_StartRotateRequest(const MotorCAN_RotateRequest *request) {
+  MachineMotionPlan *plan;
+  const MachineMotionStage *stage;
+  uint8_t stage_index;
+  uint8_t index;
+
+  if (!motor_can_ready) {
+    return MOTOR_CAN_STATUS_NOT_READY;
+  }
+  if (!motor_can_initialized) {
+    return MOTOR_CAN_STATUS_INIT_REQUIRED;
+  }
+  if ((request == NULL) ||
+      (!MachineState_IsRotateRequestValid(
+          request->face, request->role, request->angle_degrees))) {
+    return MOTOR_CAN_STATUS_INVALID_ARGUMENT;
+  }
+  if (EMS_IsStopActive()) {
+    return MOTOR_CAN_STATUS_EMS_ACTIVE;
+  }
+  if (motor_context.operation != MOTOR_CAN_OPERATION_NONE) {
+    return MOTOR_CAN_STATUS_BUSY;
+  }
+
+  MotorCAN_ResetOperation();
+  plan = &motor_context.rotate_plan;
+  if (MachineState_BuildRotatePlan(request->face, request->role,
+                                   request->angle_degrees,
+                                   plan) != MACHINE_PLAN_OK ||
+      (plan->stage_count == 0U)) {
+    MotorCAN_ResetOperation();
+    return MOTOR_CAN_STATUS_INVALID_ARGUMENT;
+  }
+
+  for (stage_index = 0U; stage_index < plan->stage_count; stage_index++) {
+    stage = &plan->stages[stage_index];
+    if (stage->motion_count == 0U) {
+      MotorCAN_ResetOperation();
+      return MOTOR_CAN_STATUS_INVALID_ARGUMENT;
+    }
+    for (index = 0U; index < stage->motion_count; index++) {
+      const uint8_t motion_bus = stage->motions[index].bus;
+      if ((!MotorCAN_IsValidBus(motion_bus)) ||
+          (!MotorCAN_IsValidNodeId(stage->motions[index].id))) {
+        MotorCAN_ResetOperation();
+        return MOTOR_CAN_STATUS_INVALID_ARGUMENT;
+      }
+      if (!motor_bus_online[motion_bus - 1U]) {
+        MotorCAN_ResetOperation();
+        return MOTOR_CAN_STATUS_NOT_READY;
+      }
+    }
+  }
+
+  motor_context.operation = MOTOR_CAN_OPERATION_ROTATE;
+  motor_context.rotate_stage_index = 0U;
+  stage = &plan->stages[plan->stage_count - 1U];
+  motor_context.id = stage->motions[0].id;
+  MotorCAN_BeginRotateStage(HAL_GetTick());
+  return MOTOR_CAN_STATUS_OK;
+}
+
+/** @brief 閒置時依 FIFO 順序啟動下一筆；失敗時丟棄其餘待執行動作。 */
+static MotorCAN_Status MotorCAN_StartNextQueuedRotate(uint8_t report_failure) {
+  MotorCAN_RotateRequest request;
+  MotorCAN_Status status;
+
+  if (motor_rotate_command_count == 0U) {
+    return MOTOR_CAN_STATUS_OK;
+  }
+  if (motor_context.operation != MOTOR_CAN_OPERATION_NONE) {
+    return MOTOR_CAN_STATUS_BUSY;
+  }
+
+  request = motor_rotate_command_queue[motor_rotate_command_head];
+  status = MotorCAN_StartRotateRequest(&request);
+  if (status == MOTOR_CAN_STATUS_OK) {
+    MotorCAN_PopRotateCommand();
+    return MOTOR_CAN_STATUS_OK;
+  }
+
+  MotorCAN_ClearRotateCommandQueue();
+  if (report_failure) {
+    MotorCAN_Event event = {0};
+    const FaceModule *module = MachineState_GetModule(request.face);
+
+    event.type = MOTOR_CAN_EVENT_ERROR;
+    event.operation = MOTOR_CAN_OPERATION_ROTATE;
+    event.error = (status == MOTOR_CAN_STATUS_NOT_READY)
+                      ? MOTOR_CAN_ERROR_BUS
+                      : MOTOR_CAN_ERROR_DEVICE_REJECTED;
+    if (module != NULL) {
+      event.bus = module->bus;
+      event.id = (request.role == MACHINE_MOTOR_BIG) ? module->big_motor_id
+                                                     : module->small_motor_id;
+    }
+    MotorCAN_PushEvent(&event);
+  }
+  return status;
 }
 
 /** @brief offset rotate 完成後，逐顆把目前位置設為新零點。 */
@@ -1416,6 +1602,11 @@ static void MotorCAN_CompleteRotateStage(void) {
     MotorCAN_CompleteRotate();
     return;
   }
+  if ((motor_context.operation == MOTOR_CAN_OPERATION_INIT) &&
+      (motor_context.init_phase == MOTOR_INIT_PHASE_READY_POSE)) {
+    MotorCAN_CompleteInit();
+    return;
+  }
   motor_context.post_offset_zero_index = 0U;
   MotorCAN_BeginNextPostOffsetZero();
 }
@@ -1436,6 +1627,11 @@ static void MotorCAN_FailOperation(MotorCAN_Error error, uint8_t stop_motion) {
    */
   if (stop_motion) {
     MotorCAN_StopActiveMotion(0U);
+  }
+
+  if ((motor_context.operation == MOTOR_CAN_OPERATION_INIT) ||
+      (motor_context.operation == MOTOR_CAN_OPERATION_ROTATE)) {
+    MotorCAN_ClearRotateCommandQueue();
   }
 
   if ((motor_context.operation == MOTOR_CAN_OPERATION_PROVISION_1M) &&
@@ -2880,6 +3076,7 @@ MotorCAN_Status MotorCAN_Init(FDCAN_HandleTypeDef *can1_handle,
   motor_can_initialized = 0U;
   motor_ems_disabled_bus_mask = 0U;
   MotorCAN_ResetOperation();
+  MotorCAN_ClearRotateCommandQueue();
   MachineState_Init();
 
   for (index = 0U; index < MOTOR_CAN_BUS_COUNT; index++) {
@@ -3212,71 +3409,58 @@ MotorCAN_Status MotorCAN_StartTest(uint8_t bus, uint16_t id) {
 }
 
 /**
- * @brief 由 machine_state 建立多馬達 plan，使用 4AH/4BH 同步執行 F4H 角度動作。
- * @param command INIT、R、R2、R_、Rw、Rw2、Rw_ 等 machine-state command。
- * @return 立即啟動狀態；完成、EMS 中止或錯誤由 event queue 回報。
+ * @brief 將新格式 ROTATE request 加入 FIFO；閒置時立即啟動第一筆。
+ * @note INIT 執行中也可先排入，會等 ready pose 完成後開始。
  */
-MotorCAN_Status MotorCAN_StartRotate(const char *command) {
-  MachineMotionPlan *plan;
-  const MachineMotionStage *stage;
-  uint8_t stage_index;
-  uint8_t index;
+MotorCAN_Status MotorCAN_QueueRotate(MachineFace face, MachineMotorRole role,
+                                     double angle_degrees,
+                                     uint8_t *pending_count) {
+  MotorCAN_RotateRequest request;
+  MotorCAN_Status status;
 
   if (!motor_can_ready) {
     return MOTOR_CAN_STATUS_NOT_READY;
   }
-  if (!motor_can_initialized) {
+  if ((!motor_can_initialized) &&
+      (motor_context.operation != MOTOR_CAN_OPERATION_INIT)) {
     return MOTOR_CAN_STATUS_INIT_REQUIRED;
   }
-  if (command == NULL) {
+  if (!MachineState_IsRotateRequestValid(face, role, angle_degrees)) {
     return MOTOR_CAN_STATUS_INVALID_ARGUMENT;
   }
   if (EMS_IsStopActive()) {
     return MOTOR_CAN_STATUS_EMS_ACTIVE;
   }
-  if (motor_context.operation != MOTOR_CAN_OPERATION_NONE) {
+  if ((motor_context.operation != MOTOR_CAN_OPERATION_NONE) &&
+      (motor_context.operation != MOTOR_CAN_OPERATION_INIT) &&
+      (motor_context.operation != MOTOR_CAN_OPERATION_ROTATE)) {
     return MOTOR_CAN_STATUS_BUSY;
   }
-
-  /* Plan 最大約 1.5 KB，直接放在 static context，避免佔用 MCU call stack。 */
-  MotorCAN_ResetOperation();
-  plan = &motor_context.rotate_plan;
-  if (MachineState_BuildRotatePlan(command, plan) != MACHINE_PLAN_OK) {
-    MotorCAN_ResetOperation();
-    return MOTOR_CAN_STATUS_INVALID_ARGUMENT;
-  }
-  if (plan->stage_count == 0U) {
-    MotorCAN_ResetOperation();
-    return MOTOR_CAN_STATUS_INVALID_ARGUMENT;
+  if (motor_rotate_command_count >= MOTOR_CAN_ROTATE_COMMAND_QUEUE_SIZE) {
+    return MOTOR_CAN_STATUS_QUEUE_FULL;
   }
 
-  /* 同一 stage 可跨 bus；每條 bus 會各自排入 Synchronization mark 與 4BH。 */
-  for (stage_index = 0U; stage_index < plan->stage_count; stage_index++) {
-    stage = &plan->stages[stage_index];
-    if (stage->motion_count == 0U) {
-      MotorCAN_ResetOperation();
-      return MOTOR_CAN_STATUS_INVALID_ARGUMENT;
-    }
-    for (index = 0U; index < stage->motion_count; index++) {
-      const uint8_t motion_bus = stage->motions[index].bus;
-      if ((!MotorCAN_IsValidBus(motion_bus)) ||
-          (!MotorCAN_IsValidNodeId(stage->motions[index].id))) {
-        MotorCAN_ResetOperation();
-        return MOTOR_CAN_STATUS_INVALID_ARGUMENT;
-      }
-      if (!motor_bus_online[motion_bus - 1U]) {
-        MotorCAN_ResetOperation();
-        return MOTOR_CAN_STATUS_NOT_READY;
-      }
+  request.face = face;
+  request.role = role;
+  request.angle_degrees = angle_degrees;
+  if (!MotorCAN_PushRotateCommand(&request)) {
+    return MOTOR_CAN_STATUS_QUEUE_FULL;
+  }
+
+  if (motor_context.operation == MOTOR_CAN_OPERATION_NONE) {
+    status = MotorCAN_StartNextQueuedRotate(0U);
+    if (status != MOTOR_CAN_STATUS_OK) {
+      return status;
     }
   }
-
-  motor_context.operation = MOTOR_CAN_OPERATION_ROTATE;
-  motor_context.rotate_stage_index = 0U;
-  stage = &plan->stages[plan->stage_count - 1U];
-  motor_context.id = stage->motions[0].id;
-  MotorCAN_BeginRotateStage(HAL_GetTick());
+  if (pending_count != NULL) {
+    *pending_count = motor_rotate_command_count;
+  }
   return MOTOR_CAN_STATUS_OK;
+}
+
+uint8_t MotorCAN_GetRotateQueueDepth(void) {
+  return motor_rotate_command_count;
 }
 
 /**
@@ -3416,6 +3600,7 @@ void MotorCAN_Process(void) {
   /* EMS 不論目前有沒有 active motion，都會清除初始化並 Disable 所有馬達。 */
   if (EMS_IsStopActive()) {
     motor_can_initialized = 0U;
+    MotorCAN_ClearRotateCommandQueue();
     (void)MotorCAN_DisableAllMotorsForEms();
   } else if (!EMS_AreCommandsBlocked()) {
     motor_ems_disabled_bus_mask = 0U;
@@ -3491,6 +3676,7 @@ uint8_t MotorCAN_ClearPendingCommands(void) {
   }
 
   MotorCAN_ResetOperation();
+  MotorCAN_ClearRotateCommandQueue();
   MotorCAN_ClearRxQueue();
   motor_event_tail = motor_event_head;
   return motors_disabled;
