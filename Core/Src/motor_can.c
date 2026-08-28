@@ -23,7 +23,7 @@
 #define MOTOR_CAN_MAX_STANDARD_ID 0x7FFU
 #define MOTOR_CAN_RX_QUEUE_SIZE 16U
 #define MOTOR_CAN_EVENT_QUEUE_SIZE 8U
-#define MOTOR_CAN_ROTATE_COMMAND_QUEUE_SIZE 16U
+#define MOTOR_CAN_ROTATE_COMMAND_QUEUE_SIZE 64U
 
 /* 各 state 等待馬達回覆的上限；所有 deadline 都以 HAL_GetTick() 的 ms 為單位。
  */
@@ -253,6 +253,7 @@ typedef struct {
   uint8_t rotate_sync_trigger_count;
   uint8_t rotate_poll_index;
   uint16_t rotate_completed_mask;
+  uint16_t rotate_status_pending_mask;
   uint32_t rotate_max_motion_ms;
   uint32_t rotate_queue_deadline;
   uint32_t rotate_status_poll_deadline;
@@ -1314,6 +1315,8 @@ static void MotorCAN_CompleteRotate(void) {
   event.type = MOTOR_CAN_EVENT_ROTATE_FINISHED;
   event.bus = motor_context.bus;
   event.id = motor_context.id;
+  /* 在下一筆移出 waiting FIFO 前保存這筆完成當下的剩餘數量。 */
+  event.pending_count = motor_rotate_command_count;
   MotorCAN_PushEvent(&event);
   MotorCAN_ResetOperation();
   (void)MotorCAN_StartNextQueuedRotate(1U);
@@ -1439,6 +1442,7 @@ static void MotorCAN_BeginRotateStage(uint32_t now) {
   motor_context.rotate_sync_trigger_count = 0U;
   motor_context.rotate_poll_index = 0U;
   motor_context.rotate_completed_mask = 0U;
+  motor_context.rotate_status_pending_mask = 0U;
   motor_context.rotate_max_motion_ms = 0U;
   motor_context.rotate_status_poll_deadline = 0U;
   for (index = 0U; index < stage->motion_count; index++) {
@@ -2247,6 +2251,21 @@ static void MotorCAN_ProcessHomeStatusPolling(uint32_t now) {
       now + MOTOR_CAN_HOME_STATUS_POLL_INTERVAL_MS;
 }
 
+/** @brief 只接受目前 stage 已主動送出 F1 查詢的對應回覆。 */
+static uint8_t
+MotorCAN_TakeExpectedRotateStatusReply(const MotorCAN_RxFrame *frame,
+                                       uint8_t index) {
+  const uint16_t pending_bit = (uint16_t)(1UL << index);
+
+  if ((frame == NULL) || (frame->data[0] != 0xF1U) ||
+      (motor_context.state != MOTOR_STATE_ROTATE_WAIT_RUN) ||
+      ((motor_context.rotate_status_pending_mask & pending_bit) == 0U)) {
+    return 0U;
+  }
+  motor_context.rotate_status_pending_mask &= (uint16_t)~pending_bit;
+  return 1U;
+}
+
 /** @brief ROTATE 執行期間輪詢各馬達 F1，全部回報停止後立即完成 stage。 */
 static void MotorCAN_ProcessRotateStatusPolling(uint32_t now) {
   const MachineMotionStage *stage;
@@ -2276,6 +2295,7 @@ static void MotorCAN_ProcessRotateStatusPolling(uint32_t now) {
       MotorCAN_FailOperation(MOTOR_CAN_ERROR_TX, 1U);
       return;
     }
+    motor_context.rotate_status_pending_mask |= completed_bit;
     motor_context.rotate_poll_index =
         (uint8_t)((index + 1U) % stage->motion_count);
     motor_context.rotate_status_poll_deadline =
@@ -2817,7 +2837,7 @@ static void MotorCAN_HandleFrame(const MotorCAN_RxFrame *frame) {
     }
     break;
 
-  /* ROTATE 接受 F4 主動完成回覆，也用 F1 輪詢補足 CanRSP 關閉的馬達。 */
+  /* ROTATE 的完成只採用本 stage 主動送出的 F1 輪詢回覆。 */
   case MOTOR_STATE_ROTATE_QUEUE_MOTIONS:
   case MOTOR_STATE_ROTATE_QUEUE_SYNC_TRIGGER:
   case MOTOR_STATE_ROTATE_REPEAT_SYNC_TRIGGER:
@@ -2842,7 +2862,7 @@ static void MotorCAN_HandleFrame(const MotorCAN_RxFrame *frame) {
       }
 
       if (frame->data[0] == 0xF1U) {
-        if (motor_context.state != MOTOR_STATE_ROTATE_WAIT_RUN) {
+        if (!MotorCAN_TakeExpectedRotateStatusReply(frame, index)) {
           break;
         }
         if (frame->data[1] == 1U) {
@@ -2858,19 +2878,16 @@ static void MotorCAN_HandleFrame(const MotorCAN_RxFrame *frame) {
         break;
       }
 
-      if (frame->data[1] == 2U) {
-        motor_context.rotate_completed_mask |= (uint16_t)(1UL << index);
-        if ((motor_context.state == MOTOR_STATE_ROTATE_WAIT_RUN) &&
-            (motor_context.rotate_completed_mask ==
-             (uint16_t)((1UL << stage->motion_count) - 1UL))) {
-          MotorCAN_CompleteRotateStage();
-        }
-      } else if (frame->data[1] == 1U) {
+      /*
+       * F4 沒有 queue generation；前一筆同 bus/id 的延遲完成回覆不能用來
+       * 完成本筆。status=2 僅視為合法回覆，真正完成由上方 fresh F1 確認。
+       */
+      if (frame->data[1] == 1U) {
         if (motor_context.state == MOTOR_STATE_ROTATE_WAIT_RUN) {
           motor_context.deadline =
               HAL_GetTick() + motor_context.rotate_max_motion_ms;
         }
-      } else if (frame->data[1] != 5U) {
+      } else if ((frame->data[1] != 2U) && (frame->data[1] != 5U)) {
         MotorCAN_FailOperation(MOTOR_CAN_ERROR_DEVICE_REJECTED, 1U);
       }
     }

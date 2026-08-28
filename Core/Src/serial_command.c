@@ -813,7 +813,7 @@ static void USB_Command_ProcessMotorEvents(void) {
     case MOTOR_CAN_EVENT_ROTATE_FINISHED:
       USB_Command_QueueText(
           "OK ROTATE bus=%u id=0x%03X synchronized=1 pending=%u complete",
-          event.bus, event.id, MotorCAN_GetRotateQueueDepth());
+          event.bus, event.id, event.pending_count);
       break;
 
     case MOTOR_CAN_EVENT_ROTATE_STOPPED_BY_EMS:

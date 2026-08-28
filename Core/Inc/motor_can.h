@@ -97,6 +97,7 @@ typedef struct
   uint16_t id;
   uint16_t old_id;
   uint16_t new_id;
+  uint8_t pending_count;
   uint8_t completed_count;
   uint16_t completed_mask;
   uint16_t missing_mask;
