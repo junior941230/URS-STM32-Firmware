@@ -44,16 +44,16 @@ static int CheckFaceAndRole(const ExpectedFace *expected,
       return 1;
     }
     return CheckMotion(&plan.stages[0].motions[0], expected->bus,
-                       expected->small_id, 60U, 255U, angle);
+                       expected->small_id, 2000U, 0U, angle);
   }
   if (plan.stages[0].motion_count != 2U) {
     puts("BIG rotate plan does not contain synchronized small and big motors");
     return 1;
   }
   return CheckMotion(&plan.stages[0].motions[0], expected->bus,
-                     expected->small_id, 30U, 254U, angle) ||
+                     expected->small_id, 1000U, 0U, angle) ||
          CheckMotion(&plan.stages[0].motions[1], expected->bus,
-                     expected->big_id, 60U, 255U, angle * 2.0);
+                     expected->big_id, 2000U, 0U, angle * 2.0);
 }
 
 static int CheckInitReadyPose(void) {
@@ -63,14 +63,14 @@ static int CheckInitReadyPose(void) {
     puts("INIT ready pose rejected");
     return 1;
   }
-  if ((plan.stage_count != 1U) ||
-      (plan.stages[0].motion_count != 3U)) {
-    puts("INIT ready pose is not one synchronized three-motor stage");
+  if ((plan.stage_count != 2U) || (plan.stages[0].motion_count != 1U) ||
+      (plan.stages[1].motion_count != 2U)) {
+    puts("INIT ready pose is not DOWN then synchronized LEFT/RIGHT");
     return 1;
   }
-  if (CheckMotion(&plan.stages[0].motions[0], 1U, 9U, 60U, 255U, 90.0) ||
-      CheckMotion(&plan.stages[0].motions[1], 2U, 5U, 60U, 255U, 90.0) ||
-      CheckMotion(&plan.stages[0].motions[2], 2U, 7U, 60U, 255U, 90.0)) {
+  if (CheckMotion(&plan.stages[0].motions[0], 2U, 7U, 2000U, 0U, 90.0) ||
+      CheckMotion(&plan.stages[1].motions[0], 1U, 9U, 2000U, 0U, 90.0) ||
+      CheckMotion(&plan.stages[1].motions[1], 2U, 5U, 2000U, 0U, 90.0)) {
     return 1;
   }
   return 0;
@@ -115,15 +115,15 @@ static int CheckConfiguredDirection(void) {
   MachineState_ConfigureFace(MACHINE_FACE_RIGHT, 2U, 4U, 5U, 0U);
   if ((MachineState_BuildRotatePlan(MACHINE_FACE_RIGHT, MACHINE_MOTOR_SMALL,
                                      12.5, &plan) != MACHINE_PLAN_OK) ||
-      CheckMotion(&plan.stages[0].motions[0], 2U, 5U, 60U, 255U, -12.5)) {
+      CheckMotion(&plan.stages[0].motions[0], 2U, 5U, 2000U, 0U, -12.5)) {
     puts("configured face direction was not applied");
     return 1;
   }
   if ((MachineState_BuildRotatePlan(MACHINE_FACE_RIGHT, MACHINE_MOTOR_BIG,
                                     12.5, &plan) != MACHINE_PLAN_OK) ||
       (plan.stages[0].motion_count != 2U) ||
-      CheckMotion(&plan.stages[0].motions[0], 2U, 5U, 30U, 254U, -12.5) ||
-      CheckMotion(&plan.stages[0].motions[1], 2U, 4U, 60U, 255U, -25.0)) {
+      CheckMotion(&plan.stages[0].motions[0], 2U, 5U, 1000U, 0U, -12.5) ||
+      CheckMotion(&plan.stages[0].motions[1], 2U, 4U, 2000U, 0U, -25.0)) {
     puts("configured face direction was not applied to BIG synchronized pair");
     return 1;
   }

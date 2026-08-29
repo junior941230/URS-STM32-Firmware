@@ -3,10 +3,8 @@
 #include <stddef.h>
 #include <string.h>
 
-#define MACHINE_ROTATE_SPEED_RPM 60U
-#define MACHINE_ROTATE_ACCELERATION 255U
-#define MACHINE_ROTATE_BIG_SMALL_SPEED_RPM 30U
-#define MACHINE_ROTATE_BIG_SMALL_ACCELERATION 254U
+#define MACHINE_ROTATE_SPEED_RPM 1000U
+#define MACHINE_ROTATE_ACCELERATION 0U
 #define MACHINE_ROTATE_BIG_ANGLE_RATIO 2.0
 #define MACHINE_INIT_READY_ANGLE_DEGREES 90.0
 #define MACHINE_ENCODER_COUNTS_PER_REVOLUTION 16384.0
@@ -34,8 +32,7 @@ static FaceModule *MachineState_GetFaceModule(MachineFace face) {
 }
 
 static uint8_t MachineState_AngleIsValid(double angle_degrees) {
-  const double minimum_angle =
-      180.0 / MACHINE_ENCODER_COUNTS_PER_REVOLUTION;
+  const double minimum_angle = 180.0 / MACHINE_ENCODER_COUNTS_PER_REVOLUTION;
   const double maximum_angle = MACHINE_MAX_RELATIVE_AXIS_COUNTS * 360.0 /
                                MACHINE_ENCODER_COUNTS_PER_REVOLUTION;
 
@@ -171,6 +168,8 @@ MachinePlanStatus MachineState_BuildRotatePlan(MachineFace face,
                                                double angle_degrees,
                                                MachineMotionPlan *plan) {
   uint8_t stage_index;
+  uint8_t small_acc;
+  uint16_t small_rpm;
   MachinePlanStatus status;
 
   if ((plan == NULL) ||
@@ -185,18 +184,19 @@ MachinePlanStatus MachineState_BuildRotatePlan(MachineFace face,
   }
   if (role == MACHINE_MOTOR_SMALL) {
     return MachineState_PlanAddFaceMotion(
-        plan, stage_index, face, MACHINE_MOTOR_SMALL,
-        MACHINE_ROTATE_SPEED_RPM, MACHINE_ROTATE_ACCELERATION, angle_degrees);
+        plan, stage_index, face, MACHINE_MOTOR_SMALL, MACHINE_ROTATE_SPEED_RPM,
+        MACHINE_ROTATE_ACCELERATION, angle_degrees);
   }
 
   /*
    * 沿用舊 FaceModule_Macro 的 2:1 機構比例：small 走輸入角度，big
    * 走兩倍角度；small 速度減半，使兩顆馬達的理想運動時間相同。
    */
-  status = MachineState_PlanAddFaceMotion(
-      plan, stage_index, face, MACHINE_MOTOR_SMALL,
-      MACHINE_ROTATE_BIG_SMALL_SPEED_RPM,
-      MACHINE_ROTATE_BIG_SMALL_ACCELERATION, angle_degrees);
+  small_acc = (uint8_t)(256U - (256U - MACHINE_ROTATE_ACCELERATION) / 0.5);
+  small_rpm = (uint16_t)(MACHINE_ROTATE_SPEED_RPM * 0.5);
+  status = MachineState_PlanAddFaceMotion(plan, stage_index, face,
+                                          MACHINE_MOTOR_SMALL, small_rpm,
+                                          small_acc, angle_degrees);
   if (status != MACHINE_PLAN_OK) {
     return status;
   }
@@ -207,8 +207,8 @@ MachinePlanStatus MachineState_BuildRotatePlan(MachineFace face,
 }
 
 MachinePlanStatus MachineState_BuildInitReadyPlan(MachineMotionPlan *plan) {
-  static const MachineFace ready_faces[] = {
-      MACHINE_FACE_LEFT, MACHINE_FACE_RIGHT, MACHINE_FACE_DOWN};
+  static const MachineFace ready_faces[] = {MACHINE_FACE_LEFT,
+                                            MACHINE_FACE_RIGHT};
   uint8_t stage_index;
   uint8_t index;
   MachinePlanStatus status;
@@ -222,8 +222,19 @@ MachinePlanStatus MachineState_BuildInitReadyPlan(MachineMotionPlan *plan) {
   if (status != MACHINE_PLAN_OK) {
     return status;
   }
-  for (index = 0U; index <
-                        (uint8_t)(sizeof(ready_faces) / sizeof(ready_faces[0]));
+  status = MachineState_PlanAddFaceMotion(
+      plan, stage_index, MACHINE_FACE_DOWN, MACHINE_MOTOR_SMALL,
+      MACHINE_ROTATE_SPEED_RPM, MACHINE_ROTATE_ACCELERATION,
+      MACHINE_INIT_READY_ANGLE_DEGREES);
+  if (status != MACHINE_PLAN_OK) {
+    return status;
+  }
+  status = MachineState_PlanAddStage(plan, &stage_index);
+  if (status != MACHINE_PLAN_OK) {
+    return status;
+  }
+  for (index = 0U;
+       index < (uint8_t)(sizeof(ready_faces) / sizeof(ready_faces[0]));
        index++) {
     status = MachineState_PlanAddFaceMotion(
         plan, stage_index, ready_faces[index], MACHINE_MOTOR_SMALL,

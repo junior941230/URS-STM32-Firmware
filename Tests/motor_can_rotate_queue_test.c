@@ -21,6 +21,8 @@ uint8_t EMS_IsStopActive(void) { return test_ems_active; }
 
 uint8_t EMS_AreCommandsBlocked(void) { return test_ems_active; }
 
+void EMS_ActivateSoftwareStop(void) { test_ems_active = 1U; }
+
 uint32_t HAL_GetTick(void) { return test_tick++; }
 
 static int CheckActiveSmall(uint8_t bus, uint16_t id, double angle) {
@@ -34,7 +36,7 @@ static int CheckActiveSmall(uint8_t bus, uint16_t id, double angle) {
   }
   motion = &motor_context.rotate_plan.stages[0].motions[0];
   if ((motion->bus != bus) || (motion->id != id) ||
-      (motion->speed_rpm != 60U) || (motion->acceleration != 255U) ||
+      (motion->speed_rpm != 2000U) || (motion->acceleration != 0U) ||
       (motion->angle_degrees != angle)) {
     printf("active mismatch: bus=%u id=%u angle=%.3f\n", motion->bus,
            motion->id, motion->angle_degrees);
@@ -59,10 +61,10 @@ static int CheckActiveBig(uint8_t bus, uint16_t big_id, uint16_t small_id,
   small = &stage->motions[0];
   big = &stage->motions[1];
   if ((small->bus != bus) || (small->id != small_id) ||
-      (small->speed_rpm != 30U) || (small->acceleration != 254U) ||
+      (small->speed_rpm != 1000U) || (small->acceleration != 0U) ||
       (small->angle_degrees != angle) || (big->bus != bus) ||
-      (big->id != big_id) || (big->speed_rpm != 60U) ||
-      (big->acceleration != 255U) ||
+      (big->id != big_id) || (big->speed_rpm != 2000U) ||
+      (big->acceleration != 0U) ||
       (big->angle_degrees != angle * 2.0)) {
     puts("active BIG synchronized pair mismatch");
     return 1;
@@ -97,6 +99,45 @@ static int CheckRotateCompletionEvent(uint8_t expected_pending) {
   return 0;
 }
 
+static int CheckInterCommandDelay(uint8_t expected_before_start) {
+  const uint32_t deadline = motor_rotate_inter_command_delay_deadline;
+  const uint8_t expected_after_start =
+      expected_before_start > 0U ? (uint8_t)(expected_before_start - 1U) : 0U;
+
+  if ((!motor_rotate_inter_command_delay_active) ||
+      (motor_context.operation != MOTOR_CAN_OPERATION_NONE)) {
+    puts("ROTATE inter-command delay was not started");
+    return 1;
+  }
+  MotorCAN_ProcessRotateInterCommandDelay(deadline - 1U);
+  if ((motor_context.operation != MOTOR_CAN_OPERATION_NONE) ||
+      (MotorCAN_GetRotateQueueDepth() != expected_before_start)) {
+    puts("next ROTATE started before 20 ms elapsed");
+    return 1;
+  }
+  MotorCAN_ProcessRotateInterCommandDelay(deadline);
+  if (motor_rotate_inter_command_delay_active ||
+      (MotorCAN_GetRotateQueueDepth() != expected_after_start)) {
+    puts("next ROTATE did not start after 20 ms elapsed");
+    return 1;
+  }
+  return 0;
+}
+
+static int CheckRotateConfirmationDeadlineGuard(void) {
+  const MachineMotorMotion motion = {
+      .speed_rpm = 2000U, .acceleration = 0U, .angle_degrees = 90.0};
+  const uint32_t now = 100U;
+
+  motor_context.rotate_max_motion_ms = MotorCAN_EstimateAngleMotionMs(&motion);
+  if ((motor_context.rotate_max_motion_ms != 8U) ||
+      (MotorCAN_RotateConfirmationDeadline(now) != 908U)) {
+    puts("ROTATE confirmation deadline has no response-time guard");
+    return 1;
+  }
+  return 0;
+}
+
 static int CheckFifoOrder(void) {
   uint8_t pending;
 
@@ -117,20 +158,20 @@ static int CheckFifoOrder(void) {
   }
 
   MotorCAN_CompleteRotate();
-  if ((MotorCAN_GetRotateQueueDepth() != 1U) ||
-      CheckActiveBig(2U, 4U, 5U, 90.0) || CheckRotateCompletionEvent(2U)) {
+  if (CheckRotateCompletionEvent(2U) || CheckInterCommandDelay(2U) ||
+      CheckActiveBig(2U, 4U, 5U, 90.0)) {
     puts("second ROTATE did not start after first completion");
     return 1;
   }
   MotorCAN_CompleteRotate();
-  if ((MotorCAN_GetRotateQueueDepth() != 0U) ||
-      CheckActiveSmall(1U, 9U, -45.5) || CheckRotateCompletionEvent(1U)) {
+  if (CheckRotateCompletionEvent(1U) || CheckInterCommandDelay(1U) ||
+      CheckActiveSmall(1U, 9U, -45.5)) {
     puts("third ROTATE did not preserve FIFO order");
     return 1;
   }
   MotorCAN_CompleteRotate();
-  if ((motor_context.operation != MOTOR_CAN_OPERATION_NONE) ||
-      CheckRotateCompletionEvent(0U)) {
+  if (CheckRotateCompletionEvent(0U) || CheckInterCommandDelay(0U) ||
+      (motor_context.operation != MOTOR_CAN_OPERATION_NONE)) {
     puts("ROTATE queue did not return to idle");
     return 1;
   }
@@ -166,6 +207,27 @@ static int CheckDelayedRotateReplyIsolation(void) {
       (motor_context.rotate_status_pending_mask != 0U) ||
       MotorCAN_TakeExpectedRotateStatusReply(&frame, 0U)) {
     puts("fresh F1 reply was not consumed exactly once");
+    return 1;
+  }
+  return 0;
+}
+
+static int CheckMissingConfirmationTriggersEms(void) {
+  uint8_t pending;
+
+  if ((MotorCAN_QueueRotate(MACHINE_FACE_RIGHT, MACHINE_MOTOR_SMALL, 90.0,
+                            &pending) != MOTOR_CAN_STATUS_OK) ||
+      (MotorCAN_QueueRotate(MACHINE_FACE_LEFT, MACHINE_MOTOR_SMALL, 90.0,
+                            &pending) != MOTOR_CAN_STATUS_OK)) {
+    puts("failed to prepare ROTATE timeout test");
+    return 1;
+  }
+  motor_context.state = MOTOR_STATE_ROTATE_WAIT_RUN;
+  MotorCAN_HandleRotateConfirmationTimeout();
+  if ((!test_ems_active) ||
+      (motor_context.operation != MOTOR_CAN_OPERATION_ROTATE) ||
+      (MotorCAN_GetRotateQueueDepth() != 1U)) {
+    puts("missing ROTATE confirmation did not latch EMS before next command");
     return 1;
   }
   return 0;
@@ -253,6 +315,9 @@ static int CheckRejections(void) {
 
 int main(void) {
   ResetTestState();
+  if (CheckRotateConfirmationDeadlineGuard()) {
+    return 1;
+  }
   if (CheckFifoOrder()) {
     return 1;
   }
@@ -266,6 +331,10 @@ int main(void) {
   }
   ResetTestState();
   if (CheckDelayedRotateReplyIsolation()) {
+    return 1;
+  }
+  ResetTestState();
+  if (CheckMissingConfirmationTriggersEms()) {
     return 1;
   }
 

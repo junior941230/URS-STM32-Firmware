@@ -60,7 +60,7 @@
 #define MOTOR_CAN_INIT_SMALL_MOTOR_OFFSET_ANGLE_DEGREES 2.0
 #define MOTOR_CAN_INIT_HOME_TIMEOUT_MS 15000U
 #define MOTOR_CAN_INIT_QUEUE_TIMEOUT_MS 3000U
-#define MOTOR_CAN_INIT_IO_RESPONSE_TIMEOUT_MS 800U
+#define MOTOR_CAN_INIT_IO_RESPONSE_TIMEOUT_MS 100U
 #define MOTOR_CAN_INIT_IO_POLL_INTERVAL_MS 10U
 #define MOTOR_CAN_INIT_STOP_POLL_INTERVAL_MS 5U
 #define MOTOR_CAN_INIT_SWITCH_STABLE_SAMPLES 3U
@@ -69,6 +69,7 @@
 
 /* ROTATE 會分批排入 TX FIFO，並依手冊以約 1 ms 間隔重送同步觸發。 */
 #define MOTOR_CAN_ROTATE_QUEUE_TIMEOUT_MS 2000U
+#define MOTOR_CAN_ROTATE_INTER_COMMAND_DELAY_MS 10U
 #define MOTOR_CAN_ROTATE_STATUS_POLL_INITIAL_DELAY_MS 10U
 #define MOTOR_CAN_ROTATE_STATUS_POLL_INTERVAL_MS 5U
 #define MOTOR_CAN_SYNC_REPEAT_INTERVAL_MS 1U
@@ -298,6 +299,8 @@ static MotorCAN_RotateRequest
 static uint8_t motor_rotate_command_head;
 static uint8_t motor_rotate_command_tail;
 static uint8_t motor_rotate_command_count;
+static uint8_t motor_rotate_inter_command_delay_active;
+static uint32_t motor_rotate_inter_command_delay_deadline;
 
 static void MotorCAN_SendOrFail(uint8_t sent, MotorCAN_State next_state,
                                 uint32_t timeout_ms);
@@ -371,6 +374,12 @@ static uint8_t MotorCAN_DeadlineReached(uint32_t now, uint32_t deadline) {
   /* signed delta 寫法在 tick overflow 前後都能正確比較相差小於 2^31 ms 的時間。
    */
   return ((int32_t)(now - deadline) >= 0) ? 1U : 0U;
+}
+
+/** @brief 動作估算時間後再保留一次 CAN 回覆 timeout 作為停止確認期限。 */
+static uint32_t MotorCAN_RotateConfirmationDeadline(uint32_t now) {
+  return now + motor_context.rotate_max_motion_ms +
+         MOTOR_CAN_COMMAND_TIMEOUT_MS;
 }
 
 /**
@@ -550,6 +559,8 @@ static void MotorCAN_ClearRotateCommandQueue(void) {
   motor_rotate_command_head = 0U;
   motor_rotate_command_tail = 0U;
   motor_rotate_command_count = 0U;
+  motor_rotate_inter_command_delay_active = 0U;
+  motor_rotate_inter_command_delay_deadline = 0U;
 }
 
 /** @brief 將已驗證的 ROTATE request 加入 FIFO 尾端。 */
@@ -1256,7 +1267,7 @@ static void MotorCAN_CompleteInit(void) {
   (void)MotorCAN_StartNextQueuedRotate(1U);
 }
 
-/** @brief homing 完成後自動執行舊 ROTATE INIT 的 L/R/D small +90 ready pose。 */
+/** @brief homing 後先執行 D small +90，再同步執行 L/R small +90。 */
 static void MotorCAN_BeginInitReadyPose(void) {
   const MachineMotionStage *stage;
   uint8_t index;
@@ -1308,7 +1319,7 @@ static void MotorCAN_ReportInitBigProgress(uint8_t index) {
   MotorCAN_PushEvent(&event);
 }
 
-/** @brief 完成同步 ROTATE，產生事件並立即啟動 FIFO 下一筆。 */
+/** @brief 完成同步 ROTATE，產生事件並開始下一筆前的非阻塞延遲。 */
 static void MotorCAN_CompleteRotate(void) {
   MotorCAN_Event event = {0};
 
@@ -1319,7 +1330,9 @@ static void MotorCAN_CompleteRotate(void) {
   event.pending_count = motor_rotate_command_count;
   MotorCAN_PushEvent(&event);
   MotorCAN_ResetOperation();
-  (void)MotorCAN_StartNextQueuedRotate(1U);
+  motor_rotate_inter_command_delay_active = 1U;
+  motor_rotate_inter_command_delay_deadline =
+      HAL_GetTick() + MOTOR_CAN_ROTATE_INTER_COMMAND_DELAY_MS;
 }
 
 /** @brief 將負 homing offset 轉成反方向的 F4H 補償角度。 */
@@ -1472,8 +1485,8 @@ MotorCAN_StartRotateRequest(const MotorCAN_RotateRequest *request) {
     return MOTOR_CAN_STATUS_INIT_REQUIRED;
   }
   if ((request == NULL) ||
-      (!MachineState_IsRotateRequestValid(
-          request->face, request->role, request->angle_degrees))) {
+      (!MachineState_IsRotateRequestValid(request->face, request->role,
+                                          request->angle_degrees))) {
     return MOTOR_CAN_STATUS_INVALID_ARGUMENT;
   }
   if (EMS_IsStopActive()) {
@@ -1558,6 +1571,21 @@ static MotorCAN_Status MotorCAN_StartNextQueuedRotate(uint8_t report_failure) {
     MotorCAN_PushEvent(&event);
   }
   return status;
+}
+
+/** @brief 等滿 20 ms 後才非阻塞啟動 ROTATE FIFO 下一筆。 */
+static void MotorCAN_ProcessRotateInterCommandDelay(uint32_t now) {
+  if ((!motor_rotate_inter_command_delay_active) ||
+      (!MotorCAN_DeadlineReached(now,
+                                 motor_rotate_inter_command_delay_deadline)) ||
+      (motor_context.operation != MOTOR_CAN_OPERATION_NONE) ||
+      (!motor_can_initialized) || EMS_AreCommandsBlocked()) {
+    return;
+  }
+
+  motor_rotate_inter_command_delay_active = 0U;
+  motor_rotate_inter_command_delay_deadline = 0U;
+  (void)MotorCAN_StartNextQueuedRotate(1U);
 }
 
 /** @brief offset rotate 完成後，逐顆把目前位置設為新零點。 */
@@ -1972,7 +2000,7 @@ static void MotorCAN_ProcessRotateQueue(uint32_t now) {
     }
 
     motor_context.state = MOTOR_STATE_ROTATE_WAIT_RUN;
-    motor_context.deadline = now + motor_context.rotate_max_motion_ms;
+    motor_context.deadline = MotorCAN_RotateConfirmationDeadline(now);
     motor_context.rotate_poll_index = 0U;
     motor_context.rotate_status_poll_deadline =
         now + MOTOR_CAN_ROTATE_STATUS_POLL_INITIAL_DELAY_MS;
@@ -2264,6 +2292,11 @@ MotorCAN_TakeExpectedRotateStatusReply(const MotorCAN_RxFrame *frame,
   }
   motor_context.rotate_status_pending_mask &= (uint16_t)~pending_bit;
   return 1U;
+}
+
+/** @brief ROTATE 未取得停止確認時鎖定 EMS，禁止 Queue 繼續執行。 */
+static void MotorCAN_HandleRotateConfirmationTimeout(void) {
+  EMS_ActivateSoftwareStop();
 }
 
 /** @brief ROTATE 執行期間輪詢各馬達 F1，全部回報停止後立即完成 stage。 */
@@ -2885,7 +2918,7 @@ static void MotorCAN_HandleFrame(const MotorCAN_RxFrame *frame) {
       if (frame->data[1] == 1U) {
         if (motor_context.state == MOTOR_STATE_ROTATE_WAIT_RUN) {
           motor_context.deadline =
-              HAL_GetTick() + motor_context.rotate_max_motion_ms;
+              MotorCAN_RotateConfirmationDeadline(HAL_GetTick());
         }
       } else if ((frame->data[1] != 2U) && (frame->data[1] != 5U)) {
         MotorCAN_FailOperation(MOTOR_CAN_ERROR_DEVICE_REJECTED, 1U);
@@ -3051,8 +3084,8 @@ static void MotorCAN_HandleTimeout(uint32_t now) {
     break;
 
   case MOTOR_STATE_ROTATE_WAIT_RUN:
-    /* CanRSP 可關閉；目前 stage 經估算動作時間後接著執行下一組。 */
-    MotorCAN_CompleteRotateStage();
+    /* 未取得目前 stage 所有馬達的 fresh F1 停止確認，直接鎖定 EMS。 */
+    MotorCAN_HandleRotateConfirmationTimeout();
     break;
 
   default:
@@ -3464,7 +3497,8 @@ MotorCAN_Status MotorCAN_QueueRotate(MachineFace face, MachineMotorRole role,
     return MOTOR_CAN_STATUS_QUEUE_FULL;
   }
 
-  if (motor_context.operation == MOTOR_CAN_OPERATION_NONE) {
+  if ((motor_context.operation == MOTOR_CAN_OPERATION_NONE) &&
+      (!motor_rotate_inter_command_delay_active)) {
     status = MotorCAN_StartNextQueuedRotate(0U);
     if (status != MOTOR_CAN_STATUS_OK) {
       return status;
@@ -3644,6 +3678,7 @@ void MotorCAN_Process(void) {
   /* INIT 與 ROTATE 的多筆 frame 都以非阻塞方式逐輪排入 FIFO。 */
   MotorCAN_ProcessInitQueue(HAL_GetTick());
   MotorCAN_ProcessHomeStatusPolling(HAL_GetTick());
+  MotorCAN_ProcessRotateInterCommandDelay(HAL_GetTick());
   MotorCAN_ProcessRotateQueue(HAL_GetTick());
   MotorCAN_ProcessRotateStatusPolling(HAL_GetTick());
 

@@ -62,6 +62,9 @@ uint8_t EMS_IsStopActive(void);
 /** @brief EMS 啟動中或釋放清理尚未完成時，禁止接收新命令。 */
 uint8_t EMS_AreCommandsBlocked(void);
 
+/** @brief 軟體觸發並鎖定 EMS；需操作實體 EMS 一次後釋放。 */
+void EMS_ActivateSoftwareStop(void);
+
 /** @brief 主迴圈是否需要執行 EMS 釋放後的 queue/state 清理。 */
 uint8_t EMS_IsReleaseCleanupPending(void);
 

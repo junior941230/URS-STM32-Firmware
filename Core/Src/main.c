@@ -407,6 +407,17 @@ uint8_t EMS_AreCommandsBlocked(void)
 }
 
 /**
+  * @brief 由韌體安全條件觸發並鎖定 EMS
+  * @note 實體 EMS 必須按下再釋放，才會進入既有的 release cleanup 流程。
+  */
+void EMS_ActivateSoftwareStop(void)
+{
+  ems_stop_active = 1U;
+  ems_release_cleanup_pending = 0U;
+  ems_serial_cleanup_pending = 0U;
+}
+
+/**
   * @brief 判斷 EMS 釋放後是否尚未清除未完成指令
   * @retval 1 表示主迴圈必須執行清理
   */
